@@ -1,0 +1,49 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build output
+dist/
+
+# Go
+*.test
+*.out
+/vendor/
+go.work
+go.work.sum
+
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE / editor
+.vscode/settings.json
+.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Test coverage
+coverage.out
+coverage.html
+
+# mise
+.mise.local.toml
+
+.kiro

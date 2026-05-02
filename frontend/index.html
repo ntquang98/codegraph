@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Code Graph Explorer</title>
+    <link rel="stylesheet" href="style.css" />
+    <!-- D3.js v7 — force-directed graph layout -->
+    <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+  </head>
+  <body>
+    <div id="app">
+      <!-- Sidebar -->
+      <aside id="sidebar">
+        <div id="sidebar-header">
+          <h1>Code Graph</h1>
+          <span
+            id="stats-badge"
+            class="badge"
+            title="Total symbols / edges"
+          ></span>
+        </div>
+
+        <!-- Search -->
+        <div id="search-section">
+          <input
+            id="search-input"
+            type="search"
+            placeholder="Search symbols…"
+            autocomplete="off"
+            aria-label="Search symbols"
+          />
+          <div
+            id="search-results"
+            role="listbox"
+            aria-label="Search results"
+          ></div>
+        </div>
+
+        <!-- Filters -->
+        <div id="filter-section">
+          <label for="kind-filter">Kind</label>
+          <select id="kind-filter" aria-label="Filter by symbol kind">
+            <option value="">All</option>
+            <option value="function">Function</option>
+            <option value="method">Method</option>
+            <option value="type">Type</option>
+            <option value="interface">Interface</option>
+            <option value="class">Class</option>
+            <option value="variable">Variable</option>
+            <option value="module">Module</option>
+          </select>
+
+          <label for="project-filter">Project</label>
+          <select id="project-filter" aria-label="Filter by project">
+            <option value="">All</option>
+          </select>
+        </div>
+
+        <!-- Symbol detail panel -->
+        <div id="detail-panel" hidden>
+          <button id="detail-close" aria-label="Close detail panel">✕</button>
+          <h2 id="detail-name"></h2>
+          <dl id="detail-meta"></dl>
+          <div id="detail-neighbors">
+            <div id="detail-callers">
+              <h3>Callers</h3>
+              <ul id="callers-list"></ul>
+            </div>
+            <div id="detail-callees">
+              <h3>Callees</h3>
+              <ul id="callees-list"></ul>
+            </div>
+          </div>
+        </div>
+
+        <!-- Project stats -->
+        <div id="projects-section">
+          <h2>Projects</h2>
+          <ul id="projects-list"></ul>
+        </div>
+      </aside>
+
+      <!-- Graph canvas -->
+      <main id="graph-container" aria-label="Code graph visualization">
+        <svg id="graph-svg" role="img" aria-label="Force-directed code graph">
+          <defs>
+            <marker
+              id="arrow"
+              viewBox="0 -5 10 10"
+              refX="18"
+              refY="0"
+              markerWidth="6"
+              markerHeight="6"
+              orient="auto"
+            >
+              <path d="M0,-5L10,0L0,5" fill="#888" />
+            </marker>
+          </defs>
+          <g id="graph-root"></g>
+        </svg>
+
+        <!-- Controls overlay -->
+        <div id="graph-controls" role="toolbar" aria-label="Graph controls">
+          <button id="btn-zoom-in" title="Zoom in" aria-label="Zoom in">
+            +
+          </button>
+          <button id="btn-zoom-out" title="Zoom out" aria-label="Zoom out">
+            −
+          </button>
+          <button
+            id="btn-zoom-reset"
+            title="Reset zoom"
+            aria-label="Reset zoom"
+          >
+            ⊙
+          </button>
+          <button
+            id="btn-layout-reset"
+            title="Re-run layout"
+            aria-label="Re-run layout"
+          >
+            ↺
+          </button>
+        </div>
+
+        <!-- Loading / empty state -->
+        <div id="graph-overlay">
+          <div id="graph-loading" hidden>
+            <div class="spinner" aria-label="Loading graph…"></div>
+            <p>Loading graph…</p>
+          </div>
+          <div id="graph-empty" hidden>
+            <p>No symbols found. Run <code>codegraph build</code> first.</p>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <script src="graph.js"></script>
+  </body>
+</html>
