@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/codegraph-cli/codegraph/internal/config"
 	"github.com/codegraph-cli/codegraph/internal/graph"
@@ -50,6 +53,17 @@ func NewBuildCmd() *cobra.Command {
 		Long:  "Parse all source files in the workspace and store the resulting symbols and edges in the graph database.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			outputFlag, _ := cmd.Root().PersistentFlags().GetString("output")
+			verbose, _ := cmd.Root().PersistentFlags().GetBool("verbose")
+
+			// Build a logger that writes to stderr. When not verbose, discard output.
+			var logger *log.Logger
+			if verbose {
+				logger = log.New(os.Stderr, "[codegraph] ", log.Ltime)
+			} else {
+				logger = log.New(io.Discard, "", 0)
+			}
+
+			logger.Println("loading workspace config...")
 
 			// Load workspace config.
 			loader := &config.Loader{}
@@ -57,15 +71,18 @@ func NewBuildCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			logger.Printf("workspace root: %s", loader.RootDir)
 
 			// Open and migrate the graph store.
 			dbPath := filepath.Join(loader.RootDir, ".codegraph.db")
+			logger.Printf("opening graph store: %s", dbPath)
 			store, err := graph.Open(dbPath)
 			if err != nil {
 				return fmt.Errorf("open graph store: %w", err)
 			}
 			defer store.Close()
 
+			logger.Println("running database migrations...")
 			if err := store.Migrate(); err != nil {
 				return fmt.Errorf("migrate graph store: %w", err)
 			}
@@ -79,7 +96,7 @@ func NewBuildCmd() *cobra.Command {
 			registry := buildRegistry()
 
 			// Run the build.
-			result, err := RunBuild(ws, store, registry, loader.RootDir)
+			result, err := RunBuild(ws, store, registry, loader.RootDir, logger)
 			if err != nil {
 				return err
 			}
@@ -103,11 +120,13 @@ func NewBuildCmd() *cobra.Command {
 // Files are parsed concurrently using a worker pool bounded by runtime.NumCPU().
 // Each file's symbols and edges are written in a single atomic transaction
 // (via UpsertFileData) to satisfy Requirement 4.4 / task 6.4.
-func RunBuild(ws *config.Workspace, store *graph.Store, registry *parse.Registry, wsRoot string) (BuildResult, error) {
+func RunBuild(ws *config.Workspace, store *graph.Store, registry *parse.Registry, wsRoot string, logger *log.Logger) (BuildResult, error) {
 	var result BuildResult
 
 	projects := flattenProjects(ws)
 	supportedExts := registry.SupportedExtensions()
+
+	logger.Printf("found %d project(s) to process", len(projects))
 
 	// Collect all (filePath, projectID) pairs that need processing.
 	type fileEntry struct {
@@ -124,15 +143,20 @@ func RunBuild(ws *config.Workspace, store *graph.Store, registry *parse.Registry
 			fmt.Fprintf(os.Stderr, "warning: skipping project %q: %v\n", proj.Name, err)
 			continue
 		}
+		logger.Printf("walking project %q at %s ...", proj.Name, absPath)
+		walkStart := time.Now()
 		files, err := walker.Walk(absPath, proj.Exclude, supportedExts)
 		if err != nil {
 			return result, fmt.Errorf("walk project %q: %w", proj.Name, err)
 		}
+		logger.Printf("  found %d file(s) in %s", len(files), time.Since(walkStart).Round(time.Millisecond))
 		projID := projectID(proj)
 		for _, f := range files {
 			allFiles = append(allFiles, fileEntry{path: f, projectID: projID})
 		}
 	}
+
+	logger.Printf("total files found: %d", len(allFiles))
 
 	// Determine which files need re-parsing (hash changed or new).
 	type workItem struct {
@@ -143,29 +167,157 @@ func RunBuild(ws *config.Workspace, store *graph.Store, registry *parse.Registry
 	}
 	var workItems []workItem
 
+	logger.Println("checking file hashes for changes...")
+	hashStart := time.Now()
+
+	// Load the entire file index in one query to avoid N individual DB round-trips.
+	fileIndex, err := store.GetAllFileIndex()
+	if err != nil {
+		return result, fmt.Errorf("load file index: %w", err)
+	}
+	logger.Printf("  loaded %d tracked file(s) from index", len(fileIndex))
+
+	// hashCheck is the result of checking one file.
+	type hashCheckResult struct {
+		path      string
+		projectID string
+		src       []byte
+		hash      string
+		skip      bool
+		err       error
+	}
+
+	total := len(allFiles)
+	hashWorkCh := make(chan fileEntry, total)
+
+	// Progress reporter: logs every 5 s while the hash workers are running.
+	progressDone := make(chan struct{})
+	progressStop := make(chan struct{})
+	var checkedCount int64
+	go func() {
+		defer close(progressDone)
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				n := atomic.LoadInt64(&checkedCount)
+				logger.Printf("  hash check progress: %d/%d files checked...", n, total)
+			case <-progressStop:
+				return
+			}
+		}
+	}()
+
+	// Spin up hash-check workers (same count as CPU workers).
+	numHashWorkers := runtime.NumCPU()
+	if numHashWorkers < 1 {
+		numHashWorkers = 1
+	}
+	var hashWg sync.WaitGroup
+	// Collect results into a slice so we can close progressDone cleanly.
+	rawHashResults := make([]hashCheckResult, 0, total)
+	rawHashMu := sync.Mutex{}
+
+	for i := 0; i < numHashWorkers; i++ {
+		hashWg.Add(1)
+		go func() {
+			defer hashWg.Done()
+			localCount := int64(0)
+			for fe := range hashWorkCh {
+				entry, known := fileIndex[fe.path]
+
+				// Fast path: if mod time matches the stored value, the file is
+				// unchanged — no need to read or hash it.
+				if known {
+					info, statErr := os.Stat(fe.path)
+					if statErr == nil && info.ModTime().UTC().Truncate(time.Second).Equal(
+						entry.ModTime.UTC().Truncate(time.Second)) {
+						localCount++
+						if localCount%10_000 == 0 {
+							atomic.AddInt64(&checkedCount, localCount)
+							localCount = 0
+						}
+						rawHashMu.Lock()
+						rawHashResults = append(rawHashResults, hashCheckResult{skip: true})
+						rawHashMu.Unlock()
+						continue
+					}
+				}
+
+				// Slow path: read file and compute SHA-256.
+				src, readErr := os.ReadFile(fe.path)
+				if readErr != nil {
+					localCount++
+					rawHashMu.Lock()
+					rawHashResults = append(rawHashResults, hashCheckResult{
+						path: fe.path, err: fmt.Errorf("read %s: %w", fe.path, readErr),
+					})
+					rawHashMu.Unlock()
+					continue
+				}
+				currentHash := hashBytes(src)
+
+				localCount++
+				if localCount%10_000 == 0 {
+					atomic.AddInt64(&checkedCount, localCount)
+					localCount = 0
+				}
+
+				if known && currentHash == entry.Hash {
+					rawHashMu.Lock()
+					rawHashResults = append(rawHashResults, hashCheckResult{skip: true})
+					rawHashMu.Unlock()
+					continue
+				}
+
+				rawHashMu.Lock()
+				rawHashResults = append(rawHashResults, hashCheckResult{
+					path:      fe.path,
+					projectID: fe.projectID,
+					src:       src,
+					hash:      currentHash,
+				})
+				rawHashMu.Unlock()
+			}
+			// Flush remaining count.
+			if localCount > 0 {
+				atomic.AddInt64(&checkedCount, localCount)
+			}
+		}()
+	}
+
+	// Feed work.
 	for _, fe := range allFiles {
-		src, err := os.ReadFile(fe.path)
-		if err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("read %s: %w", fe.path, err))
+		hashWorkCh <- fe
+	}
+	close(hashWorkCh)
+	hashWg.Wait()
+	close(progressStop)
+	<-progressDone
+
+	// Collect results.
+	for _, r := range rawHashResults {
+		if r.err != nil {
+			result.Errors = append(result.Errors, r.err)
 			continue
 		}
-		currentHash := hashBytes(src)
-		storedHash, _, err := store.GetFileHash(fe.path)
-		if err != nil {
-			return result, fmt.Errorf("get file hash %s: %w", fe.path, err)
-		}
-		if currentHash == storedHash {
-			continue // unchanged — skip
+		if r.skip {
+			continue
 		}
 		workItems = append(workItems, workItem{
-			path:      fe.path,
-			projectID: fe.projectID,
-			src:       src,
-			hash:      currentHash,
+			path:      r.path,
+			projectID: r.projectID,
+			src:       r.src,
+			hash:      r.hash,
 		})
 	}
 
+	logger.Printf("hash check done in %s: %d/%d file(s) need parsing",
+		time.Since(hashStart).Round(time.Millisecond), len(workItems), total)
+
 	if len(workItems) == 0 {
+		logger.Println("nothing to do — all files are up to date")
 		return result, nil
 	}
 
@@ -174,6 +326,8 @@ func RunBuild(ws *config.Workspace, store *graph.Store, registry *parse.Registry
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
+	logger.Printf("parsing %d file(s) with %d worker(s)...", len(workItems), numWorkers)
+	parseStart := time.Now()
 
 	type parseResult struct {
 		path      string
@@ -193,6 +347,7 @@ func RunBuild(ws *config.Workspace, store *graph.Store, registry *parse.Registry
 		go func() {
 			defer wg.Done()
 			for item := range workCh {
+				logger.Printf("  parsing %s", item.path)
 				syms, edges, err := registry.ExtractFile(item.path, item.src)
 				if err != nil {
 					resultCh <- parseResult{path: item.path, err: err}
@@ -238,6 +393,7 @@ func RunBuild(ws *config.Workspace, store *graph.Store, registry *parse.Registry
 		if len(pendingSymbols) == 0 && len(pendingEdges) == 0 {
 			return nil
 		}
+		logger.Printf("  flushing batch: %d symbols, %d edges", len(pendingSymbols), len(pendingEdges))
 		if err := store.UpsertSymbols(pendingSymbols); err != nil {
 			return fmt.Errorf("upsert symbols batch: %w", err)
 		}
@@ -278,6 +434,7 @@ func RunBuild(ws *config.Workspace, store *graph.Store, registry *parse.Registry
 			}
 		}
 	}
+	logger.Printf("parsing done in %s", time.Since(parseStart).Round(time.Millisecond))
 
 	// Final flush.
 	if err := flush(); err != nil {
@@ -285,6 +442,7 @@ func RunBuild(ws *config.Workspace, store *graph.Store, registry *parse.Registry
 	}
 
 	// Update file hashes after successful write.
+	logger.Println("updating file hashes...")
 	for _, pf := range pendingFiles {
 		info, err := os.Stat(pf.path)
 		if err != nil {
@@ -332,6 +490,8 @@ func buildRegistry() *parse.Registry {
 	reg.Register(&parse.JavaScriptExtractor{})
 	reg.Register(&parse.PythonExtractor{})
 	reg.Register(&parse.CSharpExtractor{})
+	reg.Register(&parse.RustExtractor{})
+	reg.Register(&parse.ZigExtractor{})
 	return reg
 }
 

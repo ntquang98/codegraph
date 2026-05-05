@@ -469,3 +469,64 @@ func TestProperty_SaveLoadRoundTrip(t *testing.T) {
 		}
 	})
 }
+
+// ---- Rust/Zig language support tests (task 7.3) ----
+
+func TestConfig_RustZigLanguageIDs(t *testing.T) {
+	if !isSupportedLanguage("rust") {
+		t.Error("expected isSupportedLanguage(\"rust\") to return true")
+	}
+	if !isSupportedLanguage("zig") {
+		t.Error("expected isSupportedLanguage(\"zig\") to return true")
+	}
+}
+
+func TestConfig_Detect_CargoToml(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(dir, "Cargo.toml"), []byte(`[package]\nname = "myapp"\n`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loader := &Loader{RootDir: dir}
+	ws, err := loader.Detect()
+	if err != nil {
+		t.Fatalf("Detect() returned unexpected error: %v", err)
+	}
+
+	found := false
+	for _, p := range ws.Projects {
+		if p.Language == "rust" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected a Rust project to be detected, got: %+v", ws.Projects)
+	}
+}
+
+func TestConfig_Detect_BuildZig(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(dir, "build.zig"), []byte(`const std = @import("std");\n`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loader := &Loader{RootDir: dir}
+	ws, err := loader.Detect()
+	if err != nil {
+		t.Fatalf("Detect() returned unexpected error: %v", err)
+	}
+
+	found := false
+	for _, p := range ws.Projects {
+		if p.Language == "zig" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected a Zig project to be detected, got: %+v", ws.Projects)
+	}
+}

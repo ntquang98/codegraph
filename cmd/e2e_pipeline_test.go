@@ -95,7 +95,7 @@ func TestE2E_FullPipeline(t *testing.T) {
 	}
 
 	registry := buildRegistry()
-	buildResult, err := RunBuild(ws, store, registry, root)
+	buildResult, err := RunBuild(ws, store, registry, root, discardLogger())
 	if err != nil {
 		store.Close()
 		t.Fatalf("RunBuild: %v", err)
@@ -143,7 +143,7 @@ func E2ETestFunction() string {
 		t.Fatalf("write modified service.go: %v", err)
 	}
 
-	updateResult, err := RunUpdate(ws, store, registry, root)
+	updateResult, err := RunUpdate(ws, store, registry, root, discardLogger())
 	if err != nil {
 		store.Close()
 		t.Fatalf("RunUpdate: %v", err)

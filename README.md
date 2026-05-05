@@ -134,7 +134,7 @@ codegraph clean
 | `projects[].exclude` | Glob patterns to skip (gitignore-style) |
 | `projects[].services` | Nested sub-projects for monorepos (one level deep only) |
 
-**Supported language IDs:** `go`, `typescript`, `javascript`, `python`, `csharp`, `auto`
+**Supported language IDs:** `go`, `typescript`, `javascript`, `python`, `csharp`, `rust`, `zig`, `auto`
 
 ---
 
@@ -374,6 +374,177 @@ CGO_ENABLED=0 go build -o ./bin/codegraph .
 - All file paths from `.codegraph.json` are validated to be within the workspace root before any files are read (path traversal protection).
 - All SQL queries use parameterized statements — no string interpolation of user-provided values.
 - The tool never executes source code it parses; parsing is read-only AST analysis.
+
+---
+
+## Adding a New Language
+
+This section walks through every step required to add a new language extractor. Follow the checklist at the end to track your progress.
+
+### 1. The `Extractor` interface
+
+Every language extractor implements the `Extractor` interface defined in `internal/parse/registry.go`:
+
+```go
+type Extractor interface {
+    Language()   string
+    Extensions() []string
+    Extract(path string, src []byte) ([]Symbol, []Edge, error)
+}
+```
+
+**Contract:**
+
+| Method | Contract |
+|---|---|
+| `Language()` | Returns the canonical language ID string (e.g. `"rust"`, `"zig"`). Must match the ID used in `.codegraph.json` and `SupportedLanguages`. |
+| `Extensions()` | Returns the list of file extensions this extractor handles (e.g. `[]string{".rs"}`). Extensions must be lowercase and include the leading dot. |
+| `Extract(path, src)` | Parses `src` (the full file content) and returns all `Symbol`s and `Edge`s found. `Symbol.File` must equal `path` for every returned symbol. Symbol IDs within the result set must be unique. Returns a non-nil error if the tree-sitter parser fails. |
+
+### 2. Add the tree-sitter grammar dependency
+
+Find the Go binding for your language's tree-sitter grammar on GitHub (search for `tree-sitter-<lang>` with a `binding.go`). Then add it to `go.mod`:
+
+```bash
+go get github.com/<owner>/tree-sitter-<lang>@latest
+go mod tidy
+```
+
+> **Note:** Some grammars are sub-packages of the existing `github.com/smacker/go-tree-sitter` module (e.g. Rust). Check there first before adding a new module dependency.
+
+### 3. Create the CGo extractor file
+
+Create `internal/parse/extractor_<lang>.go`. The file must start with the CGo build tag and follow the same structure as the existing extractors (e.g. `extractor_rust.go`, `extractor_go.go`):
+
+```go
+//go:build cgo
+
+package parse
+
+import (
+    "github.com/<owner>/tree-sitter-<lang>"
+    sitter "github.com/smacker/go-tree-sitter"
+)
+
+type MyLangExtractor struct{}
+
+func (e *MyLangExtractor) Language() string        { return "mylang" }
+func (e *MyLangExtractor) Extensions() []string    { return []string{".ext"} }
+
+func (e *MyLangExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, error) {
+    parser := sitter.NewParser()
+    parser.SetLanguage(mylang.GetLanguage())
+    tree := parser.Parse(nil, src)
+    if tree == nil {
+        return nil, nil, fmt.Errorf("tree-sitter failed to parse %s", path)
+    }
+    // Walk tree.RootNode() and produce Symbols and Edges ...
+}
+```
+
+Use `GenerateSymbolID(projectID, path, name, kind, workspaceRoot)` to produce stable symbol IDs. Qualify method names as `TypeName.method_name` to ensure uniqueness within a file.
+
+### 4. Add the no-CGo stub
+
+Open `internal/parse/extractors_nocgo.go` and add a stub for your extractor under the `//go:build !cgo` tag. Follow the exact pattern of the existing stubs:
+
+```go
+type MyLangExtractor struct{}
+
+func (e *MyLangExtractor) Language() string     { return "mylang" }
+func (e *MyLangExtractor) Extensions() []string { return []string{".ext"} }
+func (e *MyLangExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, error) {
+    return nil, nil, fmt.Errorf("mylang extractor requires CGO_ENABLED=1; rebuild with CGO_ENABLED=1 to enable it")
+}
+```
+
+This ensures the binary compiles with `CGO_ENABLED=0` and produces a clear error message instead of a build failure.
+
+### 5. Register the extractor at startup
+
+Find where the existing extractors are registered (in `cmd/build.go`, look for `registry.Register`). Add your extractor in the same place:
+
+```go
+registry.Register(&parse.MyLangExtractor{})
+```
+
+After registration, `registry.SupportedExtensions()` will include your new extension and files will be routed to your extractor automatically during `codegraph build` and `codegraph update`.
+
+### 6. Add the language ID to the config loader
+
+Open `internal/config/config.go` and add your language ID to the `SupportedLanguages` slice:
+
+```go
+var SupportedLanguages = []string{
+    "go",
+    // ... existing entries ...
+    "mylang",  // add here
+    "auto",
+}
+```
+
+### 7. Add auto-detection logic
+
+In the same file, add a case to the `switch` block inside `Loader.Detect()` that matches your language's project manifest file (e.g. `Cargo.toml` for Rust, `build.zig` for Zig):
+
+```go
+case name == "mylang.toml":
+    relPath, err := filepath.Rel(rootDir, dir)
+    if err != nil {
+        return err
+    }
+    project = &Project{
+        Name:     filepath.Base(dir),
+        Path:     relPath,
+        Language: "mylang",
+    }
+```
+
+After this change, `codegraph install` will automatically detect projects that contain your manifest file and set the correct language.
+
+### 8. Create test fixtures and write unit tests
+
+Create at least two source files in `testdata/<lang>-sample/` that exercise the full range of constructs your extractor handles (functions, types, imports, method definitions, call sites, etc.).
+
+Then add unit tests in `internal/parse/extractor_<lang>_test.go`:
+
+```go
+//go:build cgo
+
+func TestMyLangExtractor_BasicSymbols(t *testing.T) {
+    e := &MyLangExtractor{}
+    src := []byte(`/* small representative snippet */`)
+    syms, edges, err := e.Extract("test.ext", src)
+    require.NoError(t, err)
+    // assert expected symbol names, kinds, and edge types
+}
+
+func TestMyLangExtractor_Fixtures(t *testing.T) {
+    e := &MyLangExtractor{}
+    for _, f := range []string{"testdata/mylang-sample/models.ext", "testdata/mylang-sample/service.ext"} {
+        src, _ := os.ReadFile(f)
+        syms, edges, err := e.Extract(f, src)
+        require.NoError(t, err)
+        assert.NotEmpty(t, syms)
+        assert.NotEmpty(t, edges)
+    }
+}
+```
+
+Verify that all `Symbol.File` fields equal the input path and that all Symbol IDs within a result set are unique.
+
+### Checklist
+
+- [ ] Add the tree-sitter grammar module to `go.mod` (`go get`) and run `go mod tidy`
+- [ ] Create `internal/parse/extractor_<lang>.go` with `//go:build cgo` tag implementing the `Extractor` interface
+- [ ] Add a no-CGo stub to `internal/parse/extractors_nocgo.go` with `//go:build !cgo` tag
+- [ ] Register the extractor with `registry.Register(&parse.MyLangExtractor{})` at startup
+- [ ] Add the language ID to `SupportedLanguages` in `internal/config/config.go`
+- [ ] Add manifest file detection to `Loader.Detect()` in `internal/config/config.go`
+- [ ] Create `testdata/<lang>-sample/` with at least two representative source files
+- [ ] Write unit tests in `internal/parse/extractor_<lang>_test.go` verifying symbols, edges, `Symbol.File`, and ID uniqueness
+- [ ] Verify `CGO_ENABLED=1 go test ./...` passes
+- [ ] Verify `CGO_ENABLED=0 go build ./...` compiles without errors
 
 ---
 

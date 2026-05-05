@@ -57,3 +57,23 @@ func (e *CSharpExtractor) Extensions() []string { return []string{".cs"} }
 func (e *CSharpExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, error) {
 	return nil, nil, fmt.Errorf("csharp extractor requires CGo: rebuild with CGO_ENABLED=1 and a C compiler")
 }
+
+// RustExtractor extracts symbols and edges from Rust source files.
+// This is a stub implementation for non-CGo builds.
+type RustExtractor struct{}
+
+func (e *RustExtractor) Language() string     { return "rust" }
+func (e *RustExtractor) Extensions() []string { return []string{".rs"} }
+func (e *RustExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, error) {
+	return nil, nil, fmt.Errorf("rust extractor requires CGo: rebuild with CGO_ENABLED=1 and a C compiler")
+}
+
+// ZigExtractor extracts symbols and edges from Zig source files.
+// This is a stub implementation for non-CGo builds.
+type ZigExtractor struct{}
+
+func (e *ZigExtractor) Language() string     { return "zig" }
+func (e *ZigExtractor) Extensions() []string { return []string{".zig"} }
+func (e *ZigExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, error) {
+	return nil, nil, fmt.Errorf("zig extractor requires CGo: rebuild with CGO_ENABLED=1 and a C compiler")
+}

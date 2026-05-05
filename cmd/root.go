@@ -24,6 +24,7 @@ func Execute() {
 func init() {
 	rootCmd.PersistentFlags().String("output", "text", "Output format: text or json")
 	rootCmd.PersistentFlags().String("workspace", "", "Override workspace root directory")
+	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Enable verbose progress logging to stderr")
 }
 
 // ValidatePathWithinWorkspace resolves absPath and verifies it is within

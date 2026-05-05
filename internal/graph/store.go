@@ -311,6 +311,40 @@ func (s *Store) GetAllTrackedFiles() ([]string, error) {
 	return paths, rows.Err()
 }
 
+// FileIndexEntry holds the stored hash and modification time for a tracked file.
+type FileIndexEntry struct {
+	Hash    string
+	ModTime time.Time
+}
+
+// GetAllFileIndex returns a map of path → FileIndexEntry for every file
+// currently tracked in the file_index table. Loading the entire index in one
+// query avoids N individual round-trips during hash-change detection.
+func (s *Store) GetAllFileIndex() (map[string]FileIndexEntry, error) {
+	rows, err := s.db.Query(`SELECT path, hash, mod_time FROM file_index`)
+	if err != nil {
+		return nil, fmt.Errorf("graph: get all file index: %w", err)
+	}
+	defer rows.Close()
+
+	index := make(map[string]FileIndexEntry)
+	for rows.Next() {
+		var path, hash, modTimeStr string
+		if err := rows.Scan(&path, &hash, &modTimeStr); err != nil {
+			return nil, fmt.Errorf("graph: scan file index entry: %w", err)
+		}
+		modTime, err := time.Parse(time.RFC3339Nano, modTimeStr)
+		if err != nil {
+			modTime, err = time.Parse(time.RFC3339, modTimeStr)
+			if err != nil {
+				return nil, fmt.Errorf("graph: parse mod_time for %s: %w", path, err)
+			}
+		}
+		index[path] = FileIndexEntry{Hash: hash, ModTime: modTime}
+	}
+	return index, rows.Err()
+}
+
 // SearchSymbols returns symbols matching the given query, filtered by name,
 // kind, project, and file, with LIMIT/OFFSET pagination.
 func (s *Store) SearchSymbols(query SearchQuery) ([]parse.Symbol, error) {

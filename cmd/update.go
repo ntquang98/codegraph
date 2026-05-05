@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -32,6 +33,16 @@ func NewUpdateCmd() *cobra.Command {
 		Long:  "Compare the current workspace files against the stored file index and update only the changed files.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			outputFlag, _ := cmd.Root().PersistentFlags().GetString("output")
+			verbose, _ := cmd.Root().PersistentFlags().GetBool("verbose")
+
+			var logger *log.Logger
+			if verbose {
+				logger = log.New(os.Stderr, "[codegraph] ", log.Ltime)
+			} else {
+				logger = log.New(io.Discard, "", 0)
+			}
+
+			logger.Println("loading workspace config...")
 
 			// Load workspace config.
 			loader := &config.Loader{}
@@ -39,9 +50,11 @@ func NewUpdateCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			logger.Printf("workspace root: %s", loader.RootDir)
 
 			// Open the existing graph store (must already exist from a prior build).
 			dbPath := filepath.Join(loader.RootDir, ".codegraph.db")
+			logger.Printf("opening graph store: %s", dbPath)
 			store, err := graph.Open(dbPath)
 			if err != nil {
 				return fmt.Errorf("open graph store: %w", err)
@@ -59,7 +72,7 @@ func NewUpdateCmd() *cobra.Command {
 
 			registry := buildRegistry()
 
-			result, err := RunUpdate(ws, store, registry, loader.RootDir)
+			result, err := RunUpdate(ws, store, registry, loader.RootDir, logger)
 			if err != nil {
 				return err
 			}
@@ -81,11 +94,13 @@ func NewUpdateCmd() *cobra.Command {
 //
 // The resulting graph state is equivalent to a full build on the current workspace
 // (Property 2 / Requirement 5.5).
-func RunUpdate(ws *config.Workspace, store *graph.Store, registry *parse.Registry, wsRoot string) (UpdateResult, error) {
+func RunUpdate(ws *config.Workspace, store *graph.Store, registry *parse.Registry, wsRoot string, logger *log.Logger) (UpdateResult, error) {
 	var result UpdateResult
 
 	projects := flattenProjects(ws)
 	supportedExts := registry.SupportedExtensions()
+
+	logger.Printf("found %d project(s) to scan", len(projects))
 
 	// Walk all current files.
 	currentFiles := make(map[string]string) // path → projectID
@@ -97,10 +112,12 @@ func RunUpdate(ws *config.Workspace, store *graph.Store, registry *parse.Registr
 			fmt.Fprintf(os.Stderr, "warning: skipping project %q: %v\n", proj.Name, err)
 			continue
 		}
+		logger.Printf("walking project %q at %s ...", proj.Name, absPath)
 		files, err := walker.Walk(absPath, proj.Exclude, supportedExts)
 		if err != nil {
 			return result, fmt.Errorf("walk project %q: %w", proj.Name, err)
 		}
+		logger.Printf("  found %d file(s)", len(files))
 		projID := projectID(proj)
 		for _, f := range files {
 			currentFiles[f] = projID
@@ -157,8 +174,11 @@ func RunUpdate(ws *config.Workspace, store *graph.Store, registry *parse.Registr
 		}
 	}
 
+	logger.Printf("changes: %d to process, %d to delete", len(toProcess), len(deleted))
+
 	// Process deletions first.
 	for _, path := range deleted {
+		logger.Printf("  deleting %s", path)
 		// Count symbols being removed for the delta.
 		syms, err := store.SearchSymbols(graph.SearchQuery{File: path, Limit: 100000})
 		if err == nil {
@@ -173,6 +193,7 @@ func RunUpdate(ws *config.Workspace, store *graph.Store, registry *parse.Registr
 
 	// Process additions and modifications.
 	for _, mf := range toProcess {
+		logger.Printf("  parsing %s", mf.path)
 		syms, edges, err := registry.ExtractFile(mf.path, mf.src)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("parse %s: %w", mf.path, err))

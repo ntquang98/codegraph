@@ -17,6 +17,8 @@ var SupportedLanguages = []string{
 	"javascript",
 	"python",
 	"csharp",
+	"rust",
+	"zig",
 	"vue",
 	"auto",
 }
@@ -313,6 +315,28 @@ func (l *Loader) Detect() (*Workspace, error) {
 				Name:     projName,
 				Path:     relPath,
 				Language: "csharp",
+			}
+
+		case name == "Cargo.toml":
+			relPath, err := filepath.Rel(rootDir, dir)
+			if err != nil {
+				return err
+			}
+			project = &Project{
+				Name:     filepath.Base(dir),
+				Path:     relPath,
+				Language: "rust",
+			}
+
+		case name == "build.zig":
+			relPath, err := filepath.Rel(rootDir, dir)
+			if err != nil {
+				return err
+			}
+			project = &Project{
+				Name:     filepath.Base(dir),
+				Path:     relPath,
+				Language: "zig",
 			}
 		}
 

@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +11,11 @@ import (
 	"github.com/codegraph-cli/codegraph/internal/graph"
 	"pgregory.net/rapid"
 )
+
+// discardLogger returns a logger that discards all output (for use in tests).
+func discardLogger() *log.Logger {
+	return log.New(io.Discard, "", 0)
+}
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -45,6 +52,29 @@ func countSymbols(t *testing.T, s *graph.Store) int {
 		t.Fatalf("SearchSymbols: %v", err)
 	}
 	return len(syms)
+}
+
+// ─── Extractor Registration Smoke Tests (task 6.2) ───────────────────────────
+
+// TestBuildRegistry_IncludesRustAndZig verifies that after buildRegistry() is
+// called, the registry supports ".rs" and ".zig" file extensions.
+//
+// Requirements: 1.12, 2.11
+func TestBuildRegistry_IncludesRustAndZig(t *testing.T) {
+	registry := buildRegistry()
+	exts := registry.SupportedExtensions()
+
+	extSet := make(map[string]bool, len(exts))
+	for _, e := range exts {
+		extSet[e] = true
+	}
+
+	if !extSet[".rs"] {
+		t.Errorf("expected registry to support .rs; supported extensions: %v", exts)
+	}
+	if !extSet[".zig"] {
+		t.Errorf("expected registry to support .zig; supported extensions: %v", exts)
+	}
 }
 
 // ─── Integration Tests (task 6.5) ────────────────────────────────────────────
@@ -85,7 +115,7 @@ func TestBuild_GoSample(t *testing.T) {
 	}
 
 	registry := buildRegistry()
-	result, err := RunBuild(ws, store, registry, root)
+	result, err := RunBuild(ws, store, registry, root, discardLogger())
 	if err != nil {
 		t.Fatalf("RunBuild: %v", err)
 	}
@@ -136,7 +166,7 @@ func TestBuild_TsSample(t *testing.T) {
 	}
 
 	registry := buildRegistry()
-	result, err := RunBuild(ws, store, registry, root)
+	result, err := RunBuild(ws, store, registry, root, discardLogger())
 	if err != nil {
 		t.Fatalf("RunBuild: %v", err)
 	}
@@ -192,13 +222,13 @@ func Goodbye() string {
 	registry := buildRegistry()
 
 	// First build.
-	result1, err := RunBuild(ws, store, registry, root)
+	result1, err := RunBuild(ws, store, registry, root, discardLogger())
 	if err != nil {
 		t.Fatalf("first RunBuild: %v", err)
 	}
 
 	// Second build on unchanged files.
-	result2, err := RunBuild(ws, store, registry, root)
+	result2, err := RunBuild(ws, store, registry, root, discardLogger())
 	if err != nil {
 		t.Fatalf("second RunBuild: %v", err)
 	}
@@ -254,7 +284,7 @@ func Beta() {}
 	}
 	registry := buildRegistry()
 
-	if _, err := RunBuild(ws, buildStore, registry, root); err != nil {
+	if _, err := RunBuild(ws, buildStore, registry, root, discardLogger()); err != nil {
 		t.Fatalf("initial RunBuild: %v", err)
 	}
 
@@ -267,7 +297,7 @@ func Gamma() {}
 `)
 
 	// Run update on the build store.
-	if _, err := RunUpdate(ws, buildStore, registry, root); err != nil {
+	if _, err := RunUpdate(ws, buildStore, registry, root, discardLogger()); err != nil {
 		t.Fatalf("RunUpdate: %v", err)
 	}
 
@@ -276,7 +306,7 @@ func Gamma() {}
 	if err := freshStore.UpsertProject("src", "src", "src", "go"); err != nil {
 		t.Fatalf("UpsertProject fresh: %v", err)
 	}
-	if _, err := RunBuild(ws, freshStore, registry, root); err != nil {
+	if _, err := RunBuild(ws, freshStore, registry, root, discardLogger()); err != nil {
 		t.Fatalf("fresh RunBuild: %v", err)
 	}
 
@@ -324,7 +354,7 @@ func FuncB() {}
 	}
 	registry := buildRegistry()
 
-	if _, err := RunBuild(ws, store, registry, root); err != nil {
+	if _, err := RunBuild(ws, store, registry, root, discardLogger()); err != nil {
 		t.Fatalf("RunBuild: %v", err)
 	}
 
@@ -335,7 +365,7 @@ func FuncB() {}
 		t.Fatalf("remove fileB: %v", err)
 	}
 
-	if _, err := RunUpdate(ws, store, registry, root); err != nil {
+	if _, err := RunUpdate(ws, store, registry, root, discardLogger()); err != nil {
 		t.Fatalf("RunUpdate: %v", err)
 	}
 
@@ -376,7 +406,7 @@ func TestBuild_AtomicFileWrite(t *testing.T) {
 	}
 	registry := buildRegistry()
 
-	result1, err := RunBuild(ws, store, registry, root)
+	result1, err := RunBuild(ws, store, registry, root, discardLogger())
 	if err != nil {
 		t.Fatalf("first RunBuild: %v", err)
 	}
@@ -385,7 +415,7 @@ func TestBuild_AtomicFileWrite(t *testing.T) {
 	}
 
 	// Second build: file is unchanged, should be skipped.
-	result2, err := RunBuild(ws, store, registry, root)
+	result2, err := RunBuild(ws, store, registry, root, discardLogger())
 	if err != nil {
 		t.Fatalf("second RunBuild: %v", err)
 	}
@@ -441,13 +471,13 @@ func TestProperty_BuildIdempotent(t *testing.T) {
 		registry := buildRegistry()
 
 		// First build.
-		result1, err := RunBuild(ws, store, registry, root)
+		result1, err := RunBuild(ws, store, registry, root, discardLogger())
 		if err != nil {
 			rt.Fatalf("first RunBuild: %v", err)
 		}
 
 		// Second build on unchanged files.
-		result2, err := RunBuild(ws, store, registry, root)
+		result2, err := RunBuild(ws, store, registry, root, discardLogger())
 		if err != nil {
 			rt.Fatalf("second RunBuild: %v", err)
 		}
@@ -519,7 +549,7 @@ func TestProperty_UpdateEquivalentToBuild(t *testing.T) {
 		}
 
 		registry := buildRegistry()
-		if _, err := RunBuild(ws, updateStore, registry, root); err != nil {
+		if _, err := RunBuild(ws, updateStore, registry, root, discardLogger()); err != nil {
 			rt.Fatalf("initial RunBuild: %v", err)
 		}
 
@@ -539,7 +569,7 @@ func TestProperty_UpdateEquivalentToBuild(t *testing.T) {
 		}
 
 		// Run update on the update store.
-		if _, err := RunUpdate(ws, updateStore, registry, root); err != nil {
+		if _, err := RunUpdate(ws, updateStore, registry, root, discardLogger()); err != nil {
 			rt.Fatalf("RunUpdate: %v", err)
 		}
 
@@ -555,7 +585,7 @@ func TestProperty_UpdateEquivalentToBuild(t *testing.T) {
 		if err := freshStore.UpsertProject("src", "src", "src", "go"); err != nil {
 			rt.Fatalf("UpsertProject freshStore: %v", err)
 		}
-		if _, err := RunBuild(ws, freshStore, registry, root); err != nil {
+		if _, err := RunBuild(ws, freshStore, registry, root, discardLogger()); err != nil {
 			rt.Fatalf("fresh RunBuild: %v", err)
 		}
 

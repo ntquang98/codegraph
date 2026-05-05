@@ -9,6 +9,7 @@
 #   clean          – remove the ./bin directory
 
 # Detect OS and set binary name accordingly
+set shell := ["cmd.exe", "/C"]
 binary := if os() == "windows" { "./bin/codegraph.exe" } else { "./bin/codegraph" }
 module := "github.com/codegraph-cli/codegraph"
 
@@ -21,7 +22,7 @@ default: build
 # Compile the binary (CGO_ENABLED=0 ensures pure-Go SQLite via modernc.org/sqlite)
 build:
     mkdir -p ./bin
-    CGO_ENABLED=0 go build -o {{binary}} .
+    CGO_ENABLED=1 go build -o {{binary}} .
     @echo "Built {{binary}}"
 
 # Run all tests with the race detector
