@@ -10,6 +10,26 @@ import (
 	"strings"
 )
 
+// DefaultExcludePatterns are common dependency/build directories that should
+// always be excluded from parsing. These are written into new configs by Detect()
+// and also merged at build time so that existing configs without them are covered.
+var DefaultExcludePatterns = []string{
+	"node_modules/",
+	"vendor/",
+	"dist/",
+	"build/",
+	".git/",
+	"__pycache__/",
+	".venv/",
+	"venv/",
+	"target/",
+	"obj/",
+	"bin/",
+	".next/",
+	"out/",
+	"coverage/",
+}
+
 // SupportedLanguages lists all valid language IDs for a project's language field.
 var SupportedLanguages = []string{
 	"go",
@@ -346,6 +366,10 @@ func (l *Loader) Detect() (*Workspace, error) {
 			// Use "." for the root directory itself
 			if project.Path == "" {
 				project.Path = "."
+			}
+			// Seed new projects with sensible default exclusions.
+			if len(project.Exclude) == 0 {
+				project.Exclude = append([]string(nil), DefaultExcludePatterns...)
 			}
 			ws.Projects = append(ws.Projects, *project)
 		}

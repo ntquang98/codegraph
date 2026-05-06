@@ -5,22 +5,37 @@ package parse
 import (
 	"context"
 	"strings"
+	"sync"
 
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/javascript"
 )
 
 // JavaScriptExtractor extracts symbols and edges from JavaScript source files.
-type JavaScriptExtractor struct{}
+type JavaScriptExtractor struct {
+	parserPool sync.Pool
+}
 
 func (e *JavaScriptExtractor) Language() string     { return "javascript" }
 func (e *JavaScriptExtractor) Extensions() []string { return []string{".js", ".jsx", ".mjs", ".cjs"} }
 
+func (e *JavaScriptExtractor) getParser() *sitter.Parser {
+	if p, ok := e.parserPool.Get().(*sitter.Parser); ok {
+		return p
+	}
+	p := sitter.NewParser()
+	p.SetLanguage(javascript.GetLanguage())
+	return p
+}
+
+func (e *JavaScriptExtractor) putParser(p *sitter.Parser) {
+	e.parserPool.Put(p)
+}
+
 // Extract parses a JavaScript source file and returns all symbols and edges found.
 func (e *JavaScriptExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, error) {
-	lang := javascript.GetLanguage()
-	parser := sitter.NewParser()
-	parser.SetLanguage(lang)
+	parser := e.getParser()
+	defer e.putParser(parser)
 
 	tree, err := parser.ParseCtx(context.Background(), nil, src)
 	if err != nil {

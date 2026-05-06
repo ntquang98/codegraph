@@ -5,22 +5,37 @@ package parse
 import (
 	"context"
 	"strings"
+	"sync"
 
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/rust"
 )
 
 // RustExtractor extracts symbols and edges from Rust source files using tree-sitter.
-type RustExtractor struct{}
+type RustExtractor struct {
+	parserPool sync.Pool
+}
 
 func (e *RustExtractor) Language() string     { return "rust" }
 func (e *RustExtractor) Extensions() []string { return []string{".rs"} }
 
+func (e *RustExtractor) getParser() *sitter.Parser {
+	if p, ok := e.parserPool.Get().(*sitter.Parser); ok {
+		return p
+	}
+	p := sitter.NewParser()
+	p.SetLanguage(rust.GetLanguage())
+	return p
+}
+
+func (e *RustExtractor) putParser(p *sitter.Parser) {
+	e.parserPool.Put(p)
+}
+
 // Extract parses a Rust source file and returns all symbols and edges found.
 func (e *RustExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, error) {
-	lang := rust.GetLanguage()
-	parser := sitter.NewParser()
-	parser.SetLanguage(lang)
+	parser := e.getParser()
+	defer e.putParser(parser)
 
 	tree, err := parser.ParseCtx(context.Background(), nil, src)
 	if err != nil {
@@ -257,19 +272,55 @@ func extractRustImplBlock(node *sitter.Node, src []byte, path string) ([]Symbol,
 }
 
 // extractRustCallEdges walks the entire AST looking for call_expression nodes
-// and produces EdgeCalls edges. The enclosing function or method is used as
-// FromID where resolvable; otherwise the file module symbol is used.
+// and produces EdgeCalls edges. Uses a top-down pass to track the enclosing
+// function/method in O(n) rather than walking up the parent chain per call.
 func extractRustCallEdges(root *sitter.Node, src []byte, path string, symbolsByName map[string]string, fileModuleID string) []Edge {
 	var edges []Edge
 
-	var walk func(node *sitter.Node)
-	walk = func(node *sitter.Node) {
-		if node.Type() == "call_expression" {
+	var walk func(node *sitter.Node, enclosingID string)
+	walk = func(node *sitter.Node, enclosingID string) {
+		switch node.Type() {
+		case "function_item":
+			// Determine if this is a top-level function or an impl method.
+			newID := enclosingID
+			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+				name := nameNode.Content(src)
+				// Check for impl parent to build qualified name.
+				if parent := node.Parent(); parent != nil && parent.Type() == "declaration_list" {
+					if implNode := parent.Parent(); implNode != nil && implNode.Type() == "impl_item" {
+						if typeNode := implNode.ChildByFieldName("type"); typeNode != nil {
+							typeName := typeNode.Content(src)
+							if idx := strings.IndexByte(typeName, '<'); idx >= 0 {
+								typeName = typeName[:idx]
+							}
+							typeName = strings.TrimSpace(typeName)
+							qualifiedName := typeName + "." + name
+							if id, ok := symbolsByName[qualifiedName]; ok {
+								newID = id
+							}
+						}
+					}
+				}
+				if newID == enclosingID {
+					if id, ok := symbolsByName[name]; ok {
+						newID = id
+					}
+				}
+			}
+			for i := 0; i < int(node.ChildCount()); i++ {
+				walk(node.Child(i), newID)
+			}
+			return // children already walked above
+
+		case "call_expression":
 			funcNode := node.ChildByFieldName("function")
 			if funcNode != nil {
 				calleeName := extractRustCalleeName(funcNode, src)
 				if calleeName != "" {
-					fromID := resolveRustEnclosingID(node, src, path, symbolsByName, fileModuleID)
+					fromID := enclosingID
+					if fromID == "" {
+						fromID = fileModuleID
+					}
 					toID, ok := symbolsByName[calleeName]
 					if !ok {
 						toID = GenerateSymbolID("", path, calleeName, KindFunction, "")
@@ -284,53 +335,14 @@ func extractRustCallEdges(root *sitter.Node, src []byte, path string, symbolsByN
 				}
 			}
 		}
+
 		for i := 0; i < int(node.ChildCount()); i++ {
-			walk(node.Child(i))
+			walk(node.Child(i), enclosingID)
 		}
 	}
 
-	walk(root)
+	walk(root, "")
 	return edges
-}
-
-// resolveRustEnclosingID walks up the AST from node to find the nearest
-// enclosing function_item or impl method, returning its symbol ID.
-// Falls back to fileModuleID if no enclosing function is found.
-func resolveRustEnclosingID(node *sitter.Node, src []byte, path string, symbolsByName map[string]string, fileModuleID string) string {
-	cur := node.Parent()
-	for cur != nil {
-		if cur.Type() == "function_item" {
-			nameNode := cur.ChildByFieldName("name")
-			if nameNode != nil {
-				name := nameNode.Content(src)
-				// Check if this function is inside an impl block
-				parent := cur.Parent()
-				if parent != nil && parent.Type() == "declaration_list" {
-					implNode := parent.Parent()
-					if implNode != nil && implNode.Type() == "impl_item" {
-						typeNode := implNode.ChildByFieldName("type")
-						if typeNode != nil {
-							typeName := typeNode.Content(src)
-							if idx := strings.IndexByte(typeName, '<'); idx >= 0 {
-								typeName = typeName[:idx]
-							}
-							typeName = strings.TrimSpace(typeName)
-							qualifiedName := typeName + "." + name
-							if id, ok := symbolsByName[qualifiedName]; ok {
-								return id
-							}
-						}
-					}
-				}
-				// Top-level function
-				if id, ok := symbolsByName[name]; ok {
-					return id
-				}
-			}
-		}
-		cur = cur.Parent()
-	}
-	return fileModuleID
 }
 
 // extractRustCalleeName extracts the callee name from a function node in a

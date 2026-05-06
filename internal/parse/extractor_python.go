@@ -5,22 +5,37 @@ package parse
 import (
 	"context"
 	"strings"
+	"sync"
 
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/python"
 )
 
 // PythonExtractor extracts symbols and edges from Python source files.
-type PythonExtractor struct{}
+type PythonExtractor struct {
+	parserPool sync.Pool
+}
 
 func (e *PythonExtractor) Language() string     { return "python" }
 func (e *PythonExtractor) Extensions() []string { return []string{".py"} }
 
+func (e *PythonExtractor) getParser() *sitter.Parser {
+	if p, ok := e.parserPool.Get().(*sitter.Parser); ok {
+		return p
+	}
+	p := sitter.NewParser()
+	p.SetLanguage(python.GetLanguage())
+	return p
+}
+
+func (e *PythonExtractor) putParser(p *sitter.Parser) {
+	e.parserPool.Put(p)
+}
+
 // Extract parses a Python source file and returns all symbols and edges found.
 func (e *PythonExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, error) {
-	lang := python.GetLanguage()
-	parser := sitter.NewParser()
-	parser.SetLanguage(lang)
+	parser := e.getParser()
+	defer e.putParser(parser)
 
 	tree, err := parser.ParseCtx(context.Background(), nil, src)
 	if err != nil {

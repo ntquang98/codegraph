@@ -145,7 +145,7 @@ func RunBuild(ws *config.Workspace, store *graph.Store, registry *parse.Registry
 		}
 		logger.Printf("walking project %q at %s ...", proj.Name, absPath)
 		walkStart := time.Now()
-		files, err := walker.Walk(absPath, proj.Exclude, supportedExts)
+		files, err := walker.Walk(absPath, mergeExcludes(proj.Exclude), supportedExts)
 		if err != nil {
 			return result, fmt.Errorf("walk project %q: %w", proj.Name, err)
 		}
@@ -380,8 +380,11 @@ func RunBuild(ws *config.Workspace, store *graph.Store, registry *parse.Registry
 		close(resultCh)
 	}()
 
-	// Collect results and write to store in batches of 500.
-	const batchSize = 500
+	// Collect results and write to store in batches of 500 symbols or 2000 edges,
+	// whichever is hit first. Both symbols and edges are written in a single
+	// atomic transaction via UpsertBatch to halve the number of fsync commits.
+	const batchSymbols = 500
+	const batchEdges = 2000
 	var pendingSymbols []parse.Symbol
 	var pendingEdges []parse.Edge
 	var pendingFiles []struct {
@@ -394,11 +397,8 @@ func RunBuild(ws *config.Workspace, store *graph.Store, registry *parse.Registry
 			return nil
 		}
 		logger.Printf("  flushing batch: %d symbols, %d edges", len(pendingSymbols), len(pendingEdges))
-		if err := store.UpsertSymbols(pendingSymbols); err != nil {
-			return fmt.Errorf("upsert symbols batch: %w", err)
-		}
-		if err := store.UpsertEdges(pendingEdges); err != nil {
-			return fmt.Errorf("upsert edges batch: %w", err)
+		if err := store.UpsertBatch(pendingSymbols, pendingEdges); err != nil {
+			return fmt.Errorf("upsert batch: %w", err)
 		}
 		pendingSymbols = pendingSymbols[:0]
 		pendingEdges = pendingEdges[:0]
@@ -427,8 +427,8 @@ func RunBuild(ws *config.Workspace, store *graph.Store, registry *parse.Registry
 		result.EdgesAdded += len(pr.edges)
 		result.FilesProcessed++
 
-		// Flush when batch is full.
-		if len(pendingSymbols) >= batchSize {
+		// Flush when either threshold is hit.
+		if len(pendingSymbols) >= batchSymbols || len(pendingEdges) >= batchEdges {
 			if err := flush(); err != nil {
 				return result, err
 			}
@@ -539,4 +539,24 @@ func printBuildResultJSON(w io.Writer, result BuildResult) error {
 
 func init() {
 	rootCmd.AddCommand(NewBuildCmd())
+}
+
+// mergeExcludes returns the union of the project's own exclude patterns and the
+// default exclude patterns, deduplicating entries so patterns aren't applied twice.
+func mergeExcludes(projectExcludes []string) []string {
+	seen := make(map[string]struct{}, len(projectExcludes)+len(config.DefaultExcludePatterns))
+	result := make([]string, 0, len(projectExcludes)+len(config.DefaultExcludePatterns))
+	for _, p := range projectExcludes {
+		if _, ok := seen[p]; !ok {
+			seen[p] = struct{}{}
+			result = append(result, p)
+		}
+	}
+	for _, p := range config.DefaultExcludePatterns {
+		if _, ok := seen[p]; !ok {
+			seen[p] = struct{}{}
+			result = append(result, p)
+		}
+	}
+	return result
 }

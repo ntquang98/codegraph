@@ -5,22 +5,37 @@ package parse
 import (
 	"context"
 	"strings"
+	"sync"
 
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/golang"
 )
 
 // GoExtractor extracts symbols and edges from Go source files using tree-sitter.
-type GoExtractor struct{}
+type GoExtractor struct {
+	parserPool sync.Pool
+}
 
-func (e *GoExtractor) Language() string       { return "go" }
-func (e *GoExtractor) Extensions() []string   { return []string{".go"} }
+func (e *GoExtractor) Language() string     { return "go" }
+func (e *GoExtractor) Extensions() []string { return []string{".go"} }
+
+func (e *GoExtractor) getParser() *sitter.Parser {
+	if p, ok := e.parserPool.Get().(*sitter.Parser); ok {
+		return p
+	}
+	p := sitter.NewParser()
+	p.SetLanguage(golang.GetLanguage())
+	return p
+}
+
+func (e *GoExtractor) putParser(p *sitter.Parser) {
+	e.parserPool.Put(p)
+}
 
 // Extract parses a Go source file and returns all symbols and edges found.
 func (e *GoExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, error) {
-	lang := golang.GetLanguage()
-	parser := sitter.NewParser()
-	parser.SetLanguage(lang)
+	parser := e.getParser()
+	defer e.putParser(parser)
 
 	tree, err := parser.ParseCtx(context.Background(), nil, src)
 	if err != nil {
@@ -72,7 +87,9 @@ func (e *GoExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, error)
 		}
 	}
 
-	// Second pass: extract call edges from function/method bodies
+	// Second pass: extract call edges from function/method bodies.
+	// Build a node-ID → enclosing-symbol-ID map in a single top-down pass
+	// so call resolution is O(n) instead of O(calls × depth).
 	callEdges := extractGoCallEdges(root, src, path, symbolsByName)
 	edges = append(edges, callEdges...)
 
@@ -261,63 +278,51 @@ func extractGoImports(node *sitter.Node, src []byte, path string) ([]Symbol, []E
 }
 
 // extractGoCallEdges walks the AST looking for call_expression nodes.
+// It builds the enclosing-function map in a single top-down pass (O(n) in
+// AST nodes) rather than walking up the parent chain for every call node.
 func extractGoCallEdges(root *sitter.Node, src []byte, path string, symbolsByName map[string]string) []Edge {
 	var edges []Edge
-	var walk func(node *sitter.Node, enclosingID string)
+	fileModuleID := GenerateSymbolID("", path, path, KindModule, "")
 
-	// Find the enclosing function/method for a node
-	getEnclosingID := func(node *sitter.Node) string {
-		// Walk up to find function_declaration or method_declaration
-		cur := node.Parent()
-		for cur != nil {
-			switch cur.Type() {
-			case "function_declaration":
-				nameNode := cur.ChildByFieldName("name")
-				if nameNode != nil {
-					name := nameNode.Content(src)
-					if id, ok := symbolsByName[name]; ok {
-						return id
-					}
+	var walk func(node *sitter.Node, enclosingID string)
+	walk = func(node *sitter.Node, enclosingID string) {
+		// When we enter a function or method body, update the enclosing ID.
+		switch node.Type() {
+		case "function_declaration":
+			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+				if id, ok := symbolsByName[nameNode.Content(src)]; ok {
+					enclosingID = id
 				}
-			case "method_declaration":
-				nameNode := cur.ChildByFieldName("name")
-				receiverNode := cur.ChildByFieldName("receiver")
-				if nameNode != nil {
-					name := nameNode.Content(src)
-					if receiverNode != nil {
-						receiverText := strings.Trim(receiverNode.Content(src), "()")
-						parts := strings.Fields(receiverText)
-						if len(parts) >= 2 {
-							typeName := strings.TrimPrefix(parts[len(parts)-1], "*")
-							qualifiedName := typeName + "." + name
-							if id, ok := symbolsByName[qualifiedName]; ok {
-								return id
-							}
+			}
+		case "method_declaration":
+			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+				name := nameNode.Content(src)
+				// Try qualified name first (ReceiverType.MethodName)
+				if receiverNode := node.ChildByFieldName("receiver"); receiverNode != nil {
+					receiverText := strings.Trim(receiverNode.Content(src), "()")
+					parts := strings.Fields(receiverText)
+					if len(parts) >= 2 {
+						typeName := strings.TrimPrefix(parts[len(parts)-1], "*")
+						qualifiedName := typeName + "." + name
+						if id, ok := symbolsByName[qualifiedName]; ok {
+							enclosingID = id
 						}
 					}
+				}
+				if enclosingID == "" {
 					if id, ok := symbolsByName[name]; ok {
-						return id
+						enclosingID = id
 					}
 				}
 			}
-			cur = cur.Parent()
-		}
-		return ""
-	}
-
-	walk = func(node *sitter.Node, enclosingID string) {
-		if node.Type() == "call_expression" {
+		case "call_expression":
 			funcNode := node.ChildByFieldName("function")
 			if funcNode != nil {
 				calleeName := extractGoCalleeName(funcNode, src)
 				if calleeName != "" {
 					fromID := enclosingID
 					if fromID == "" {
-						fromID = getEnclosingID(node)
-					}
-					if fromID == "" {
-						// Use file module as fallback
-						fromID = GenerateSymbolID("", path, path, KindModule, "")
+						fromID = fileModuleID
 					}
 					toID, ok := symbolsByName[calleeName]
 					if !ok {

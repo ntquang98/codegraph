@@ -5,22 +5,37 @@ package parse
 import (
 	"context"
 	"strings"
+	"sync"
 
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/csharp"
 )
 
 // CSharpExtractor extracts symbols and edges from C# source files.
-type CSharpExtractor struct{}
+type CSharpExtractor struct {
+	parserPool sync.Pool
+}
 
 func (e *CSharpExtractor) Language() string     { return "csharp" }
 func (e *CSharpExtractor) Extensions() []string { return []string{".cs"} }
 
+func (e *CSharpExtractor) getParser() *sitter.Parser {
+	if p, ok := e.parserPool.Get().(*sitter.Parser); ok {
+		return p
+	}
+	p := sitter.NewParser()
+	p.SetLanguage(csharp.GetLanguage())
+	return p
+}
+
+func (e *CSharpExtractor) putParser(p *sitter.Parser) {
+	e.parserPool.Put(p)
+}
+
 // Extract parses a C# source file and returns all symbols and edges found.
 func (e *CSharpExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, error) {
-	lang := csharp.GetLanguage()
-	parser := sitter.NewParser()
-	parser.SetLanguage(lang)
+	parser := e.getParser()
+	defer e.putParser(parser)
 
 	tree, err := parser.ParseCtx(context.Background(), nil, src)
 	if err != nil {

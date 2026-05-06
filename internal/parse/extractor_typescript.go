@@ -5,22 +5,37 @@ package parse
 import (
 	"context"
 	"strings"
+	"sync"
 
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/typescript/typescript"
 )
 
 // TypeScriptExtractor extracts symbols and edges from TypeScript source files.
-type TypeScriptExtractor struct{}
+type TypeScriptExtractor struct {
+	parserPool sync.Pool
+}
 
 func (e *TypeScriptExtractor) Language() string     { return "typescript" }
 func (e *TypeScriptExtractor) Extensions() []string { return []string{".ts", ".tsx"} }
 
+func (e *TypeScriptExtractor) getParser() *sitter.Parser {
+	if p, ok := e.parserPool.Get().(*sitter.Parser); ok {
+		return p
+	}
+	p := sitter.NewParser()
+	p.SetLanguage(typescript.GetLanguage())
+	return p
+}
+
+func (e *TypeScriptExtractor) putParser(p *sitter.Parser) {
+	e.parserPool.Put(p)
+}
+
 // Extract parses a TypeScript source file and returns all symbols and edges found.
 func (e *TypeScriptExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, error) {
-	lang := typescript.GetLanguage()
-	parser := sitter.NewParser()
-	parser.SetLanguage(lang)
+	parser := e.getParser()
+	defer e.putParser(parser)
 
 	tree, err := parser.ParseCtx(context.Background(), nil, src)
 	if err != nil {

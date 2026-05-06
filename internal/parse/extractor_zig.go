@@ -5,6 +5,7 @@ package parse
 import (
 	"context"
 	"strings"
+	"sync"
 
 	sitter "github.com/smacker/go-tree-sitter"
 	zigbinding "github.com/codegraph-cli/codegraph/internal/parse/zig"
@@ -16,16 +17,30 @@ func getZigLanguage() *sitter.Language {
 }
 
 // ZigExtractor extracts symbols and edges from Zig source files using tree-sitter.
-type ZigExtractor struct{}
+type ZigExtractor struct {
+	parserPool sync.Pool
+}
 
 func (e *ZigExtractor) Language() string     { return "zig" }
 func (e *ZigExtractor) Extensions() []string { return []string{".zig"} }
 
+func (e *ZigExtractor) getParser() *sitter.Parser {
+	if p, ok := e.parserPool.Get().(*sitter.Parser); ok {
+		return p
+	}
+	p := sitter.NewParser()
+	p.SetLanguage(getZigLanguage())
+	return p
+}
+
+func (e *ZigExtractor) putParser(p *sitter.Parser) {
+	e.parserPool.Put(p)
+}
+
 // Extract parses a Zig source file and returns all symbols and edges found.
 func (e *ZigExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, error) {
-	lang := getZigLanguage()
-	parser := sitter.NewParser()
-	parser.SetLanguage(lang)
+	parser := e.getParser()
+	defer e.putParser(parser)
 
 	tree, err := parser.ParseCtx(context.Background(), nil, src)
 	if err != nil {
@@ -322,21 +337,49 @@ func extractZigStructMethods(containerNode *sitter.Node, src []byte, path string
 }
 
 // extractZigCallEdges walks the entire AST looking for function call nodes and
-// produces EdgeCalls edges.
-//
-// In the Zig grammar, a function call is represented as a SuffixExpr that contains
-// FnCallArguments. The callee is either:
-//   - A SuffixExpr with a "variable_type_function" field (simple call: foo(...))
-//   - A SuffixExpr followed by FieldOrFnCall with "function_call" field (method call: obj.method(...))
+// produces EdgeCalls edges. Uses a top-down pass to track the enclosing function
+// in O(n) rather than walking up the parent chain per call node.
 func extractZigCallEdges(root *sitter.Node, src []byte, path string, symbolsByName map[string]string, fileModuleID string) []Edge {
 	var edges []Edge
 
-	var walk func(node *sitter.Node)
-	walk = func(node *sitter.Node) {
+	var walk func(node *sitter.Node, enclosingID string)
+	walk = func(node *sitter.Node, enclosingID string) {
+		// When entering a Decl that contains a FnProto, update the enclosing ID.
+		if node.Type() == "Decl" {
+			for i := 0; i < int(node.ChildCount()); i++ {
+				child := node.Child(i)
+				if child.Type() == "FnProto" {
+					if nameNode := child.ChildByFieldName("function"); nameNode != nil {
+						fnName := nameNode.Content(src)
+						// Check if this Decl is inside a ContainerDecl (struct method).
+						if parent := node.Parent(); parent != nil && parent.Type() == "ContainerDecl" {
+							if grandParent := parent.Parent(); grandParent != nil && grandParent.Type() == "VarDecl" {
+								if structNameNode := grandParent.ChildByFieldName("variable_type_function"); structNameNode != nil {
+									qualifiedName := structNameNode.Content(src) + "." + fnName
+									if id, ok := symbolsByName[qualifiedName]; ok {
+										enclosingID = id
+									}
+								}
+							}
+						}
+						if enclosingID == "" {
+							if id, ok := symbolsByName[fnName]; ok {
+								enclosingID = id
+							}
+						}
+					}
+					break
+				}
+			}
+		}
+
 		if node.Type() == "SuffixExpr" {
 			calleeName := extractZigCalleeName(node, src)
 			if calleeName != "" {
-				fromID := resolveZigEnclosingID(node, src, path, symbolsByName, fileModuleID)
+				fromID := enclosingID
+				if fromID == "" {
+					fromID = fileModuleID
+				}
 				toID, ok := symbolsByName[calleeName]
 				if !ok {
 					toID = GenerateSymbolID("", path, calleeName, KindFunction, "")
@@ -350,12 +393,13 @@ func extractZigCallEdges(root *sitter.Node, src []byte, path string, symbolsByNa
 				})
 			}
 		}
+
 		for i := 0; i < int(node.ChildCount()); i++ {
-			walk(node.Child(i))
+			walk(node.Child(i), enclosingID)
 		}
 	}
 
-	walk(root)
+	walk(root, "")
 	return edges
 }
 
@@ -405,48 +449,6 @@ func extractZigCalleeName(node *sitter.Node, src []byte) string {
 		return calleeName
 	}
 	return ""
-}
-
-// resolveZigEnclosingID walks up the AST from node to find the nearest enclosing
-// function (FnProto inside a Decl), returning its symbol ID.
-// Falls back to fileModuleID if no enclosing function is found.
-func resolveZigEnclosingID(node *sitter.Node, src []byte, path string, symbolsByName map[string]string, fileModuleID string) string {
-	cur := node.Parent()
-	for cur != nil {
-		if cur.Type() == "Decl" {
-			// Look for FnProto inside this Decl
-			for i := 0; i < int(cur.ChildCount()); i++ {
-				child := cur.Child(i)
-				if child.Type() == "FnProto" {
-					nameNode := child.ChildByFieldName("function")
-					if nameNode != nil {
-						fnName := nameNode.Content(src)
-						// Check if this is a struct method (parent of Decl is ContainerDecl)
-						parent := cur.Parent()
-						if parent != nil && parent.Type() == "ContainerDecl" {
-							// Find the struct name by going up to VarDecl
-							grandParent := parent.Parent()
-							if grandParent != nil && grandParent.Type() == "VarDecl" {
-								structNameNode := grandParent.ChildByFieldName("variable_type_function")
-								if structNameNode != nil {
-									qualifiedName := structNameNode.Content(src) + "." + fnName
-									if id, ok := symbolsByName[qualifiedName]; ok {
-										return id
-									}
-								}
-							}
-						}
-						// Top-level function
-						if id, ok := symbolsByName[fnName]; ok {
-							return id
-						}
-					}
-				}
-			}
-		}
-		cur = cur.Parent()
-	}
-	return fileModuleID
 }
 
 // findChildByType finds the first direct child of node with the given type.

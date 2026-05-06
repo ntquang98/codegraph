@@ -45,16 +45,30 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("graph: open db: %w", err)
 	}
 
-	// Enable WAL mode for concurrent read/write access.
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("graph: enable WAL: %w", err)
-	}
+	// Limit to a single connection so all PRAGMA settings are applied to the
+	// same connection that executes queries (SQLite is not safe for concurrent
+	// writes anyway).
+	db.SetMaxOpenConns(1)
 
-	// Enable foreign key enforcement.
-	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("graph: enable foreign keys: %w", err)
+	pragmas := []string{
+		// WAL mode: readers don't block writers and vice-versa.
+		"PRAGMA journal_mode=WAL",
+		// NORMAL sync is safe with WAL and much faster than FULL (the default).
+		"PRAGMA synchronous=NORMAL",
+		// 64 MB page cache kept in memory.
+		"PRAGMA cache_size=-65536",
+		// Store temp tables / indexes in memory instead of on disk.
+		"PRAGMA temp_store=MEMORY",
+		// Memory-map up to 256 MB of the database file for faster reads.
+		"PRAGMA mmap_size=268435456",
+		// Foreign key enforcement.
+		"PRAGMA foreign_keys=ON",
+	}
+	for _, p := range pragmas {
+		if _, err := db.Exec(p); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("graph: %s: %w", p, err)
+		}
 	}
 
 	return &Store{db: db}, nil
@@ -90,6 +104,10 @@ func (s *Store) Migrate() error {
 
 // UpsertSymbols inserts or replaces all symbols in a single transaction and
 // keeps the FTS index in sync atomically.
+//
+// Instead of per-row prepared-statement loops, it builds bulk INSERT statements
+// with up to sqliteMaxVars/9 rows per chunk (9 placeholders per symbol row) to
+// stay within SQLite's SQLITE_MAX_VARIABLE_NUMBER limit.
 func (s *Store) UpsertSymbols(symbols []parse.Symbol) error {
 	if len(symbols) == 0 {
 		return nil
@@ -101,47 +119,8 @@ func (s *Store) UpsertSymbols(symbols []parse.Symbol) error {
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	symStmt, err := tx.Prepare(`
-		INSERT OR REPLACE INTO symbols
-			(id, name, kind, file, start_line, end_line, signature, doc_comment, project_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		return fmt.Errorf("graph: prepare upsert symbol: %w", err)
-	}
-	defer symStmt.Close()
-
-	// For the FTS table we delete the old entry (if any) then insert the new one.
-	ftsDelStmt, err := tx.Prepare(`DELETE FROM symbols_fts WHERE id = ?`)
-	if err != nil {
-		return fmt.Errorf("graph: prepare fts delete: %w", err)
-	}
-	defer ftsDelStmt.Close()
-
-	ftsInsStmt, err := tx.Prepare(`
-		INSERT INTO symbols_fts (id, name, signature, doc_comment)
-		VALUES (?, ?, ?, ?)
-	`)
-	if err != nil {
-		return fmt.Errorf("graph: prepare fts insert: %w", err)
-	}
-	defer ftsInsStmt.Close()
-
-	for _, sym := range symbols {
-		if _, err := symStmt.Exec(
-			sym.ID, sym.Name, string(sym.Kind), sym.File,
-			sym.StartLine, sym.EndLine, sym.Signature, sym.DocComment, sym.ProjectID,
-		); err != nil {
-			return fmt.Errorf("graph: upsert symbol %s: %w", sym.ID, err)
-		}
-
-		// Keep FTS in sync: remove stale entry, insert fresh one.
-		if _, err := ftsDelStmt.Exec(sym.ID); err != nil {
-			return fmt.Errorf("graph: fts delete %s: %w", sym.ID, err)
-		}
-		if _, err := ftsInsStmt.Exec(sym.ID, sym.Name, sym.Signature, sym.DocComment); err != nil {
-			return fmt.Errorf("graph: fts insert %s: %w", sym.ID, err)
-		}
+	if err := upsertSymbolsTx(tx, symbols); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -150,7 +129,92 @@ func (s *Store) UpsertSymbols(symbols []parse.Symbol) error {
 	return nil
 }
 
+// upsertSymbolsTx performs the bulk symbol + FTS upsert inside an existing
+// transaction. It is also called by UpsertBatch so both share one transaction.
+func upsertSymbolsTx(tx *sql.Tx, symbols []parse.Symbol) error {
+	// SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999 (or 32766 on newer
+	// builds). We use 999 as a safe lower bound.
+	const maxVars = 999
+	const colsPerSymbol = 9 // symbols table
+	const colsPerFTS = 4    // fts table
+	symChunk := maxVars / colsPerSymbol // 111 rows per chunk
+	ftsChunk := maxVars / colsPerFTS    // 249 rows per chunk
+
+	// Bulk upsert into symbols table.
+	for i := 0; i < len(symbols); i += symChunk {
+		end := i + symChunk
+		if end > len(symbols) {
+			end = len(symbols)
+		}
+		chunk := symbols[i:end]
+
+		rows := make([]string, len(chunk))
+		for j := range rows {
+			rows[j] = "(?,?,?,?,?,?,?,?,?)"
+		}
+		q := "INSERT OR REPLACE INTO symbols (id, name, kind, file, start_line, end_line, signature, doc_comment, project_id) VALUES " + strings.Join(rows, ",")
+
+		args := make([]interface{}, 0, len(chunk)*colsPerSymbol)
+		for _, sym := range chunk {
+			args = append(args, sym.ID, sym.Name, string(sym.Kind), sym.File,
+				sym.StartLine, sym.EndLine, sym.Signature, sym.DocComment, sym.ProjectID)
+		}
+		if _, err := tx.Exec(q, args...); err != nil {
+			return fmt.Errorf("graph: bulk upsert symbols: %w", err)
+		}
+	}
+
+	// Collect IDs for bulk FTS delete.
+	ids := make([]interface{}, len(symbols))
+	idMarks := make([]string, len(symbols))
+	for i, sym := range symbols {
+		ids[i] = sym.ID
+		idMarks[i] = "?"
+	}
+
+	// Bulk delete stale FTS entries (chunked to stay within variable limit).
+	for i := 0; i < len(ids); i += maxVars {
+		end := i + maxVars
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[i:end]
+		marks := idMarks[i:end]
+		if _, err := tx.Exec("DELETE FROM symbols_fts WHERE id IN ("+strings.Join(marks, ",")+`)`+``, chunk...); err != nil {
+			return fmt.Errorf("graph: bulk fts delete: %w", err)
+		}
+	}
+
+	// Bulk insert fresh FTS entries.
+	for i := 0; i < len(symbols); i += ftsChunk {
+		end := i + ftsChunk
+		if end > len(symbols) {
+			end = len(symbols)
+		}
+		chunk := symbols[i:end]
+
+		rows := make([]string, len(chunk))
+		for j := range rows {
+			rows[j] = "(?,?,?,?)"
+		}
+		q := "INSERT INTO symbols_fts (id, name, signature, doc_comment) VALUES " + strings.Join(rows, ",")
+
+		args := make([]interface{}, 0, len(chunk)*colsPerFTS)
+		for _, sym := range chunk {
+			args = append(args, sym.ID, sym.Name, sym.Signature, sym.DocComment)
+		}
+		if _, err := tx.Exec(q, args...); err != nil {
+			return fmt.Errorf("graph: bulk fts insert: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // UpsertEdges inserts or replaces all edges in a single transaction.
+//
+// Uses bulk DELETE + INSERT with chunked placeholders to avoid per-row
+// round-trips and stay within SQLite's variable limit.
 func (s *Store) UpsertEdges(edges []parse.Edge) error {
 	if len(edges) == 0 {
 		return nil
@@ -162,37 +226,96 @@ func (s *Store) UpsertEdges(edges []parse.Edge) error {
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// Edges use an auto-increment PK so we cannot do a true INSERT OR REPLACE
-	// without knowing the rowid. Instead we delete matching (from_id, to_id, kind,
-	// file, line) tuples first, then insert fresh rows.
-	delStmt, err := tx.Prepare(`
-		DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file = ? AND line = ?
-	`)
-	if err != nil {
-		return fmt.Errorf("graph: prepare edge delete: %w", err)
-	}
-	defer delStmt.Close()
-
-	insStmt, err := tx.Prepare(`
-		INSERT INTO edges (from_id, to_id, kind, file, line)
-		VALUES (?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		return fmt.Errorf("graph: prepare edge insert: %w", err)
-	}
-	defer insStmt.Close()
-
-	for _, e := range edges {
-		if _, err := delStmt.Exec(e.FromID, e.ToID, string(e.Kind), e.File, e.Line); err != nil {
-			return fmt.Errorf("graph: delete edge: %w", err)
-		}
-		if _, err := insStmt.Exec(e.FromID, e.ToID, string(e.Kind), e.File, e.Line); err != nil {
-			return fmt.Errorf("graph: insert edge: %w", err)
-		}
+	if err := upsertEdgesTx(tx, edges); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("graph: upsert edges commit: %w", err)
+	}
+	return nil
+}
+
+// upsertEdgesTx performs the bulk edge upsert inside an existing transaction.
+func upsertEdgesTx(tx *sql.Tx, edges []parse.Edge) error {
+	const maxVars = 999
+	const colsPerEdge = 5 // from_id, to_id, kind, file, line
+	edgeChunk := maxVars / colsPerEdge // 199 rows per chunk
+
+	// Delete matching edges first (edges use auto-increment PK so INSERT OR
+	// REPLACE would create duplicates). We delete by the logical key tuple.
+	for i := 0; i < len(edges); i += edgeChunk {
+		end := i + edgeChunk
+		if end > len(edges) {
+			end = len(edges)
+		}
+		chunk := edges[i:end]
+
+		rows := make([]string, len(chunk))
+		for j := range rows {
+			rows[j] = "(?,?,?,?,?)"
+		}
+		q := "DELETE FROM edges WHERE (from_id, to_id, kind, file, line) IN (" + strings.Join(rows, ",") + ")"
+		args := make([]interface{}, 0, len(chunk)*colsPerEdge)
+		for _, e := range chunk {
+			args = append(args, e.FromID, e.ToID, string(e.Kind), e.File, e.Line)
+		}
+		if _, err := tx.Exec(q, args...); err != nil {
+			return fmt.Errorf("graph: bulk delete edges: %w", err)
+		}
+	}
+
+	// Bulk insert fresh edges.
+	for i := 0; i < len(edges); i += edgeChunk {
+		end := i + edgeChunk
+		if end > len(edges) {
+			end = len(edges)
+		}
+		chunk := edges[i:end]
+
+		rows := make([]string, len(chunk))
+		for j := range rows {
+			rows[j] = "(?,?,?,?,?)"
+		}
+		q := "INSERT INTO edges (from_id, to_id, kind, file, line) VALUES " + strings.Join(rows, ",")
+		args := make([]interface{}, 0, len(chunk)*colsPerEdge)
+		for _, e := range chunk {
+			args = append(args, e.FromID, e.ToID, string(e.Kind), e.File, e.Line)
+		}
+		if _, err := tx.Exec(q, args...); err != nil {
+			return fmt.Errorf("graph: bulk insert edges: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// UpsertBatch writes symbols and edges in a single atomic transaction,
+// avoiding the overhead of two separate commits per flush.
+func (s *Store) UpsertBatch(symbols []parse.Symbol, edges []parse.Edge) error {
+	if len(symbols) == 0 && len(edges) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("graph: upsert batch begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if len(symbols) > 0 {
+		if err := upsertSymbolsTx(tx, symbols); err != nil {
+			return err
+		}
+	}
+	if len(edges) > 0 {
+		if err := upsertEdgesTx(tx, edges); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("graph: upsert batch commit: %w", err)
 	}
 	return nil
 }
