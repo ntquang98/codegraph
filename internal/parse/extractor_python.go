@@ -213,6 +213,16 @@ func extractPyImport(node *sitter.Node, src []byte, path string) ([]Symbol, []Ed
 	var edges []Edge
 
 	fileModuleID := GenerateSymbolID("", path, path, KindModule, "")
+	syms = append(syms, Symbol{
+		ID:        fileModuleID,
+		Name:      path,
+		Kind:      KindModule,
+		File:      path,
+		StartLine: 1,
+		EndLine:   1,
+		Signature: path,
+		ProjectID: "",
+	})
 
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
@@ -258,6 +268,16 @@ func extractPyImportFrom(node *sitter.Node, src []byte, path string) ([]Symbol, 
 	var edges []Edge
 
 	fileModuleID := GenerateSymbolID("", path, path, KindModule, "")
+	syms = append(syms, Symbol{
+		ID:        fileModuleID,
+		Name:      path,
+		Kind:      KindModule,
+		File:      path,
+		StartLine: 1,
+		EndLine:   1,
+		Signature: path,
+		ProjectID: "",
+	})
 
 	// Find the module name (dotted_name after "from")
 	var moduleName string

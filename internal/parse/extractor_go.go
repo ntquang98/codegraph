@@ -236,8 +236,19 @@ func extractGoImports(node *sitter.Node, src []byte, path string) ([]Symbol, []E
 	var syms []Symbol
 	var edges []Edge
 
-	// Create a module symbol for the current file
+	// Create a module symbol for the current file and emit it so edges
+	// that use fileModuleID as from_id have a valid source symbol.
 	fileModuleID := GenerateSymbolID("", path, path, KindModule, "")
+	syms = append(syms, Symbol{
+		ID:        fileModuleID,
+		Name:      path,
+		Kind:      KindModule,
+		File:      path,
+		StartLine: 1,
+		EndLine:   1,
+		Signature: path,
+		ProjectID: "",
+	})
 
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)

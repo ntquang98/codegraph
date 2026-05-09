@@ -48,22 +48,20 @@ func (e *CSharpExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, er
 	var edges []Edge
 	symbolsByName := make(map[string]string)
 
-	var walk func(node *sitter.Node, enclosingClass string)
-	walk = func(node *sitter.Node, enclosingClass string) {
+	var walk func(node *sitter.Node, enclosingClass string, enclosingMethodID string)
+	walk = func(node *sitter.Node, enclosingClass string, enclosingMethodID string) {
 		switch node.Type() {
 		case "class_declaration":
 			sym := extractCSClass(node, src, path)
 			if sym != nil {
 				symbols = append(symbols, *sym)
 				symbolsByName[sym.Name] = sym.ID
-				// Extract base_list edges (implements/extends)
 				classEdges := extractCSBaseList(node, src, path, sym.ID, symbolsByName)
 				edges = append(edges, classEdges...)
-				// Walk class body
 				bodyNode := node.ChildByFieldName("body")
 				if bodyNode != nil {
 					for i := 0; i < int(bodyNode.ChildCount()); i++ {
-						walk(bodyNode.Child(i), sym.Name)
+						walk(bodyNode.Child(i), sym.Name, sym.ID)
 					}
 				}
 			}
@@ -73,7 +71,6 @@ func (e *CSharpExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, er
 			if sym != nil {
 				symbols = append(symbols, *sym)
 				symbolsByName[sym.Name] = sym.ID
-				// Extract base_list edges
 				ifaceEdges := extractCSBaseList(node, src, path, sym.ID, symbolsByName)
 				edges = append(edges, ifaceEdges...)
 			}
@@ -83,15 +80,24 @@ func (e *CSharpExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, er
 			if sym != nil {
 				symbols = append(symbols, *sym)
 				symbolsByName[sym.Name] = sym.ID
+				// Walk method body with this method as the enclosing symbol.
+				for i := 0; i < int(node.ChildCount()); i++ {
+					walk(node.Child(i), enclosingClass, sym.ID)
+				}
+				return
 			}
 		case "constructor_declaration":
 			sym := extractCSConstructor(node, src, path, enclosingClass)
 			if sym != nil {
 				symbols = append(symbols, *sym)
 				symbolsByName[sym.Name] = sym.ID
+				for i := 0; i < int(node.ChildCount()); i++ {
+					walk(node.Child(i), enclosingClass, sym.ID)
+				}
+				return
 			}
 		case "invocation_expression":
-			callEdge := extractCSCallEdge(node, src, path, symbolsByName)
+			callEdge := extractCSCallEdgeWithCaller(node, src, path, symbolsByName, enclosingMethodID)
 			if callEdge != nil {
 				edges = append(edges, *callEdge)
 			}
@@ -101,10 +107,10 @@ func (e *CSharpExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, er
 			edges = append(edges, importEdges...)
 		}
 		for i := 0; i < int(node.ChildCount()); i++ {
-			walk(node.Child(i), enclosingClass)
+			walk(node.Child(i), enclosingClass, enclosingMethodID)
 		}
 	}
-	walk(root, "")
+	walk(root, "", "")
 
 	return symbols, edges, nil
 }
@@ -279,9 +285,9 @@ func extractCSTypeName(node *sitter.Node, src []byte) string {
 	return ""
 }
 
-// extractCSCallEdge extracts an invocation_expression node and creates a calls edge.
-func extractCSCallEdge(node *sitter.Node, src []byte, path string, symbolsByName map[string]string) *Edge {
-	// invocation_expression has a "function" field
+// extractCSCallEdgeWithCaller extracts an invocation_expression and creates a
+// calls edge using the actual enclosing method as from_id.
+func extractCSCallEdgeWithCaller(node *sitter.Node, src []byte, path string, symbolsByName map[string]string, callerID string) *Edge {
 	funcNode := node.ChildByFieldName("function")
 	if funcNode == nil {
 		return nil
@@ -291,7 +297,10 @@ func extractCSCallEdge(node *sitter.Node, src []byte, path string, symbolsByName
 		return nil
 	}
 
-	fromID := GenerateSymbolID("", path, path, KindModule, "")
+	fromID := callerID
+	if fromID == "" {
+		fromID = GenerateSymbolID("", path, path, KindModule, "")
+	}
 	toID, ok := symbolsByName[calleeName]
 	if !ok {
 		toID = GenerateSymbolID("", path, calleeName, KindMethod, "")
@@ -324,6 +333,16 @@ func extractCSUsing(node *sitter.Node, src []byte, path string) ([]Symbol, []Edg
 	var edges []Edge
 
 	fileModuleID := GenerateSymbolID("", path, path, KindModule, "")
+	syms = append(syms, Symbol{
+		ID:        fileModuleID,
+		Name:      path,
+		Kind:      KindModule,
+		File:      path,
+		StartLine: 1,
+		EndLine:   1,
+		Signature: path,
+		ProjectID: "",
+	})
 
 	// Find the namespace name
 	var namespaceName string

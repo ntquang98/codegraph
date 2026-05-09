@@ -48,14 +48,20 @@ func (e *JavaScriptExtractor) Extract(path string, src []byte) ([]Symbol, []Edge
 	var edges []Edge
 	symbolsByName := make(map[string]string)
 
-	var walk func(node *sitter.Node)
-	walk = func(node *sitter.Node) {
+	fileModuleID := GenerateSymbolID("", path, path, KindModule, "")
+
+	var walk func(node *sitter.Node, enclosingID string)
+	walk = func(node *sitter.Node, enclosingID string) {
 		switch node.Type() {
 		case "function_declaration":
 			sym := extractJSFunction(node, src, path)
 			if sym != nil {
 				symbols = append(symbols, *sym)
 				symbolsByName[sym.Name] = sym.ID
+				for i := 0; i < int(node.ChildCount()); i++ {
+					walk(node.Child(i), sym.ID)
+				}
+				return
 			}
 		case "lexical_declaration", "variable_declaration":
 			syms := extractJSArrowFunctions(node, src, path)
@@ -64,6 +70,14 @@ func (e *JavaScriptExtractor) Extract(path string, src []byte) ([]Symbol, []Edge
 				symbols = append(symbols, sym)
 				symbolsByName[sym.Name] = sym.ID
 			}
+			newEnclosing := enclosingID
+			if len(syms) > 0 {
+				newEnclosing = syms[0].ID
+			}
+			for i := 0; i < int(node.ChildCount()); i++ {
+				walk(node.Child(i), newEnclosing)
+			}
+			return
 		case "class_declaration":
 			sym := extractJSClass(node, src, path)
 			if sym != nil {
@@ -75,23 +89,45 @@ func (e *JavaScriptExtractor) Extract(path string, src []byte) ([]Symbol, []Edge
 					symbols = append(symbols, m)
 					symbolsByName[m.Name] = m.ID
 				}
+				// Walk class body with each method as enclosing.
+				bodyNode := node.ChildByFieldName("body")
+				if bodyNode != nil {
+					for i := 0; i < int(bodyNode.ChildCount()); i++ {
+						member := bodyNode.Child(i)
+						if member.Type() == "method_definition" {
+							methodNameNode := member.ChildByFieldName("name")
+							if methodNameNode != nil {
+								className := ""
+								if nn := node.ChildByFieldName("name"); nn != nil {
+									className = nn.Content(src)
+								}
+								qn := className + "." + methodNameNode.Content(src)
+								mid := GenerateSymbolID("", path, qn, KindMethod, "")
+								walk(member, mid)
+								continue
+							}
+						}
+						walk(member, sym.ID)
+					}
+				}
 			}
-			return // children already processed
+			return
 		case "import_statement":
 			importSyms, importEdges := extractJSImports(node, src, path)
 			symbols = append(symbols, importSyms...)
 			edges = append(edges, importEdges...)
+			return
 		case "call_expression":
-			callEdge := extractJSCallEdge(node, src, path, symbolsByName)
+			callEdge := extractJSCallEdgeWithCaller(node, src, path, symbolsByName, enclosingID, fileModuleID)
 			if callEdge != nil {
 				edges = append(edges, *callEdge)
 			}
 		}
 		for i := 0; i < int(node.ChildCount()); i++ {
-			walk(node.Child(i))
+			walk(node.Child(i), enclosingID)
 		}
 	}
-	walk(root)
+	walk(root, fileModuleID)
 
 	return symbols, edges, nil
 }
@@ -218,6 +254,16 @@ func extractJSImports(node *sitter.Node, src []byte, path string) ([]Symbol, []E
 	var edges []Edge
 
 	fileModuleID := GenerateSymbolID("", path, path, KindModule, "")
+	syms = append(syms, Symbol{
+		ID:        fileModuleID,
+		Name:      path,
+		Kind:      KindModule,
+		File:      path,
+		StartLine: 1,
+		EndLine:   1,
+		Signature: path,
+		ProjectID: "",
+	})
 
 	var importPath string
 	for i := 0; i < int(node.ChildCount()); i++ {
@@ -252,7 +298,7 @@ func extractJSImports(node *sitter.Node, src []byte, path string) ([]Symbol, []E
 	return syms, edges
 }
 
-func extractJSCallEdge(node *sitter.Node, src []byte, path string, symbolsByName map[string]string) *Edge {
+func extractJSCallEdgeWithCaller(node *sitter.Node, src []byte, path string, symbolsByName map[string]string, callerID, fileModuleID string) *Edge {
 	funcNode := node.ChildByFieldName("function")
 	if funcNode == nil {
 		return nil
@@ -262,7 +308,10 @@ func extractJSCallEdge(node *sitter.Node, src []byte, path string, symbolsByName
 		return nil
 	}
 
-	fromID := GenerateSymbolID("", path, path, KindModule, "")
+	fromID := callerID
+	if fromID == "" {
+		fromID = fileModuleID
+	}
 	toID, ok := symbolsByName[calleeName]
 	if !ok {
 		toID = GenerateSymbolID("", path, calleeName, KindFunction, "")

@@ -441,6 +441,18 @@ func RunBuild(ws *config.Workspace, store *graph.Store, registry *parse.Registry
 		return result, err
 	}
 
+	// Prune orphan edges — edges whose from_id or to_id no longer exists in
+	// the symbols table. This can happen when files are deleted or re-parsed
+	// with different symbol IDs. Running this after every build keeps the DB
+	// consistent without requiring a full rebuild.
+	logger.Println("pruning orphan edges...")
+	pruned, err := store.PruneOrphanEdges()
+	if err != nil {
+		logger.Printf("  warning: prune orphan edges: %v", err)
+	} else if pruned > 0 {
+		logger.Printf("  pruned %d orphan edge(s)", pruned)
+	}
+
 	// Update file hashes after successful write.
 	logger.Println("updating file hashes...")
 	for _, pf := range pendingFiles {

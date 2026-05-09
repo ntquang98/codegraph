@@ -28,6 +28,9 @@ type mockStore struct {
 func (m *mockStore) SearchSymbols(_ graph.SearchQuery) ([]parse.Symbol, error) {
 	return m.symbols, m.err
 }
+func (m *mockStore) CountSymbols(_ graph.SearchQuery) (int, error) {
+	return len(m.symbols), m.err
+}
 func (m *mockStore) GetSymbol(_ string) (*parse.Symbol, error) {
 	return m.symbol, m.err
 }
@@ -45,6 +48,15 @@ func (m *mockStore) FullTextSearch(_ string, _ int) ([]parse.Symbol, error) {
 }
 func (m *mockStore) GetAllTrackedFiles() ([]string, error) {
 	return m.files, m.err
+}
+func (m *mockStore) GetAllEdges() ([]parse.Edge, error) {
+	return nil, m.err
+}
+func (m *mockStore) GetEdgesForNodes(_ map[string]struct{}) ([]parse.Edge, error) {
+	return nil, m.err
+}
+func (m *mockStore) GetEdgesFromNodes(_ map[string]struct{}) ([]parse.Edge, error) {
+	return nil, m.err
 }
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────

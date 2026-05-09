@@ -21,12 +21,13 @@ type Store struct {
 
 // SearchQuery holds parameters for filtering symbols.
 type SearchQuery struct {
-	Name      string
-	Kind      parse.SymbolKind
-	ProjectID string
-	File      string
-	Limit     int
-	Offset    int
+	Name        string
+	Kind        parse.SymbolKind
+	ExcludeKind parse.SymbolKind // exclude symbols of this kind (e.g. KindModule)
+	ProjectID   string
+	File        string
+	Limit       int
+	Offset      int
 }
 
 // ProjectStats holds aggregate statistics for a single project.
@@ -53,6 +54,8 @@ func Open(path string) (*Store, error) {
 	pragmas := []string{
 		// WAL mode: readers don't block writers and vice-versa.
 		"PRAGMA journal_mode=WAL",
+		// Wait up to 5 seconds when the database is locked before returning SQLITE_BUSY.
+		"PRAGMA busy_timeout=5000",
 		// NORMAL sync is safe with WAL and much faster than FULL (the default).
 		"PRAGMA synchronous=NORMAL",
 		// 64 MB page cache kept in memory.
@@ -63,6 +66,34 @@ func Open(path string) (*Store, error) {
 		"PRAGMA mmap_size=268435456",
 		// Foreign key enforcement.
 		"PRAGMA foreign_keys=ON",
+	}
+	for _, p := range pragmas {
+		if _, err := db.Exec(p); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("graph: %s: %w", p, err)
+		}
+	}
+
+	return &Store{db: db}, nil
+}
+
+// OpenReadOnly opens the database at path in read-only mode.
+// This is used by the UI server which never writes to the database.
+// Read-only mode avoids acquiring write locks and works even when another
+// process has the database open for writing.
+func OpenReadOnly(path string) (*Store, error) {
+	// The modernc sqlite driver accepts URI filenames; ?mode=ro opens read-only.
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_busy_timeout=5000&_journal_mode=WAL&cache=shared")
+	if err != nil {
+		return nil, fmt.Errorf("graph: open db read-only: %w", err)
+	}
+
+	db.SetMaxOpenConns(4) // reads can be concurrent
+
+	pragmas := []string{
+		"PRAGMA cache_size=-65536",
+		"PRAGMA temp_store=MEMORY",
+		"PRAGMA mmap_size=268435456",
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {
@@ -482,6 +513,10 @@ func (s *Store) SearchSymbols(query SearchQuery) ([]parse.Symbol, error) {
 		conditions = append(conditions, "kind = ?")
 		args = append(args, string(query.Kind))
 	}
+	if query.ExcludeKind != "" {
+		conditions = append(conditions, "kind != ?")
+		args = append(args, string(query.ExcludeKind))
+	}
 	if query.ProjectID != "" {
 		conditions = append(conditions, "project_id = ?")
 		args = append(args, query.ProjectID)
@@ -511,6 +546,87 @@ func (s *Store) SearchSymbols(query SearchQuery) ([]parse.Symbol, error) {
 	defer rows.Close()
 
 	return scanSymbols(rows)
+}
+
+// GetEdgesFromNodes returns all valid edges where from_id is in the provided
+// nodeIDs set. Unlike GetEdgesForNodes, the to_id does not need to be in the
+// set — this shows outgoing connections even when the target isn't on the page.
+// Only edges where to_id also exists in the symbols table are returned.
+func (s *Store) GetEdgesFromNodes(nodeIDs map[string]struct{}) ([]parse.Edge, error) {
+	if len(nodeIDs) == 0 {
+		return nil, nil
+	}
+
+	placeholders := make([]string, 0, len(nodeIDs))
+	ids := make([]interface{}, 0, len(nodeIDs))
+	for id := range nodeIDs {
+		placeholders = append(placeholders, "?")
+		ids = append(ids, id)
+	}
+	inClause := strings.Join(placeholders, ",")
+
+	q := "SELECT from_id, to_id, kind, file, line FROM edges" +
+		" WHERE from_id IN (" + inClause + ")" +
+		" AND EXISTS (SELECT 1 FROM symbols WHERE id = to_id)"
+
+	rows, err := s.db.Query(q, ids...)
+	if err != nil {
+		return nil, fmt.Errorf("graph: get edges from nodes: %w", err)
+	}
+	defer rows.Close()
+
+	var edges []parse.Edge
+	for rows.Next() {
+		var e parse.Edge
+		if err := rows.Scan(&e.FromID, &e.ToID, &e.Kind, &e.File, &e.Line); err != nil {
+			return nil, fmt.Errorf("graph: scan edge: %w", err)
+		}
+		edges = append(edges, e)
+	}
+	return edges, rows.Err()
+}
+
+// GetEdgesForNodes returns all edges where both from_id and to_id are in the
+// provided nodeIDs set. This avoids fetching the entire edge table when only
+// a page of nodes is being displayed.
+func (s *Store) GetEdgesForNodes(nodeIDs map[string]struct{}) ([]parse.Edge, error) {
+	if len(nodeIDs) == 0 {
+		return nil, nil
+	}
+
+	// Build a parameterised IN clause without fmt.Sprintf to satisfy the
+	// SQL safety linter (no string interpolation of user data).
+	placeholders := make([]string, 0, len(nodeIDs))
+	ids := make([]interface{}, 0, len(nodeIDs))
+	for id := range nodeIDs {
+		placeholders = append(placeholders, "?")
+		ids = append(ids, id)
+	}
+	inClause := strings.Join(placeholders, ",")
+
+	// We need the same id list twice: once for from_id, once for to_id.
+	args := make([]interface{}, 0, len(ids)*2)
+	args = append(args, ids...)
+	args = append(args, ids...)
+
+	q := "SELECT from_id, to_id, kind, file, line FROM edges" +
+		" WHERE from_id IN (" + inClause + ") AND to_id IN (" + inClause + ")"
+
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("graph: get edges for nodes: %w", err)
+	}
+	defer rows.Close()
+
+	var edges []parse.Edge
+	for rows.Next() {
+		var e parse.Edge
+		if err := rows.Scan(&e.FromID, &e.ToID, &e.Kind, &e.File, &e.Line); err != nil {
+			return nil, fmt.Errorf("graph: scan edge: %w", err)
+		}
+		edges = append(edges, e)
+	}
+	return edges, rows.Err()
 }
 
 // GetSymbol returns the symbol with the given ID, or nil if not found.
@@ -688,35 +804,201 @@ LIMIT ?
 	return scanSymbols(rows)
 }
 
-// GetProjectStats returns aggregate symbol, edge, and file counts per project.
-func (s *Store) GetProjectStats() ([]ProjectStats, error) {
-	const q = `
-SELECT
-    p.id AS project_id,
-    COUNT(DISTINCT s.id)   AS symbol_count,
-    COUNT(DISTINCT e.id)   AS edge_count,
-    COUNT(DISTINCT fi.path) AS file_count
-FROM projects p
-LEFT JOIN symbols s  ON s.project_id  = p.id
-LEFT JOIN edges e    ON e.from_id IN (SELECT id FROM symbols WHERE project_id = p.id)
-LEFT JOIN file_index fi ON fi.project_id = p.id
-GROUP BY p.id
-`
+// CountSymbols returns the total number of symbols matching the query filters.
+// It is used for pagination metadata without fetching all rows.
+func (s *Store) CountSymbols(query SearchQuery) (int, error) {
+	var conditions []string
+	var args []interface{}
+
+	if query.Name != "" {
+		conditions = append(conditions, "name LIKE ?")
+		args = append(args, "%"+query.Name+"%")
+	}
+	if query.Kind != "" {
+		conditions = append(conditions, "kind = ?")
+		args = append(args, string(query.Kind))
+	}
+	if query.ExcludeKind != "" {
+		conditions = append(conditions, "kind != ?")
+		args = append(args, string(query.ExcludeKind))
+	}
+	if query.ProjectID != "" {
+		conditions = append(conditions, "project_id = ?")
+		args = append(args, query.ProjectID)
+	}
+	if query.File != "" {
+		conditions = append(conditions, "file = ?")
+		args = append(args, query.File)
+	}
+
+	q := `SELECT COUNT(*) FROM symbols`
+	if len(conditions) > 0 {
+		q += " WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	var count int
+	if err := s.db.QueryRow(q, args...).Scan(&count); err != nil {
+		return 0, fmt.Errorf("graph: count symbols: %w", err)
+	}
+	return count, nil
+}
+
+// PruneOrphanEdges deletes all edges whose from_id or to_id does not exist in
+// the symbols table. Returns the number of edges deleted.
+// This is used to repair databases that have stale edges from deleted symbols.
+func (s *Store) PruneOrphanEdges() (int, error) {
+	res, err := s.db.Exec(`
+		DELETE FROM edges
+		WHERE from_id NOT IN (SELECT id FROM symbols)
+		   OR to_id   NOT IN (SELECT id FROM symbols)
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("graph: prune orphan edges: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// CountEdges returns the total number of edges in the database.
+func (s *Store) CountEdges() (int, error) {
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM edges`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("graph: count edges: %w", err)
+	}
+	return count, nil
+}
+
+// CountValidEdges returns the number of edges where both from_id and to_id
+// exist in the symbols table. Orphan edges are excluded.
+func (s *Store) CountValidEdges() (int, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM edges e
+		WHERE EXISTS (SELECT 1 FROM symbols WHERE id = e.from_id)
+		  AND EXISTS (SELECT 1 FROM symbols WHERE id = e.to_id)
+	`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("graph: count valid edges: %w", err)
+	}
+	return count, nil
+}
+
+// GetAllEdges returns all edges in the database as a flat slice.
+// This is used by the UI /api/graph endpoint to avoid N+1 queries.
+func (s *Store) GetAllEdges() ([]parse.Edge, error) {
+	const q = `SELECT from_id, to_id, kind, file, line FROM edges`
 	rows, err := s.db.Query(q)
 	if err != nil {
-		return nil, fmt.Errorf("graph: get project stats: %w", err)
+		return nil, fmt.Errorf("graph: get all edges: %w", err)
 	}
 	defer rows.Close()
 
-	var stats []ProjectStats
+	var edges []parse.Edge
 	for rows.Next() {
-		var ps ProjectStats
-		if err := rows.Scan(&ps.ProjectID, &ps.SymbolCount, &ps.EdgeCount, &ps.FileCount); err != nil {
-			return nil, fmt.Errorf("graph: scan project stats: %w", err)
+		var e parse.Edge
+		if err := rows.Scan(&e.FromID, &e.ToID, &e.Kind, &e.File, &e.Line); err != nil {
+			return nil, fmt.Errorf("graph: scan edge: %w", err)
 		}
-		stats = append(stats, ps)
+		edges = append(edges, e)
 	}
-	return stats, rows.Err()
+	return edges, rows.Err()
+}
+
+// GetProjectStats returns aggregate symbol, edge, and file counts per project.
+// Uses simple per-table GROUP BY queries and joins them in Go to avoid the
+// correlated subquery on edges that was causing timeouts on large databases.
+func (s *Store) GetProjectStats() ([]ProjectStats, error) {
+	// 1. Get all projects.
+	projRows, err := s.db.Query(`SELECT id FROM projects`)
+	if err != nil {
+		return nil, fmt.Errorf("graph: get projects: %w", err)
+	}
+	defer projRows.Close()
+	var projectIDs []string
+	for projRows.Next() {
+		var id string
+		if err := projRows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("graph: scan project id: %w", err)
+		}
+		projectIDs = append(projectIDs, id)
+	}
+	if err := projRows.Err(); err != nil {
+		return nil, err
+	}
+	projRows.Close()
+
+	if len(projectIDs) == 0 {
+		return nil, nil
+	}
+
+	// 2. Symbol counts per project (fast — indexed on project_id).
+	symCounts := make(map[string]int, len(projectIDs))
+	symRows, err := s.db.Query(`SELECT project_id, COUNT(*) FROM symbols GROUP BY project_id`)
+	if err != nil {
+		return nil, fmt.Errorf("graph: symbol counts: %w", err)
+	}
+	defer symRows.Close()
+	for symRows.Next() {
+		var pid string
+		var cnt int
+		if err := symRows.Scan(&pid, &cnt); err != nil {
+			return nil, fmt.Errorf("graph: scan symbol count: %w", err)
+		}
+		symCounts[pid] = cnt
+	}
+	symRows.Close()
+
+	// 3. File counts per project (fast — indexed on project_id).
+	fileCounts := make(map[string]int, len(projectIDs))
+	fileRows, err := s.db.Query(`SELECT project_id, COUNT(*) FROM file_index GROUP BY project_id`)
+	if err != nil {
+		return nil, fmt.Errorf("graph: file counts: %w", err)
+	}
+	defer fileRows.Close()
+	for fileRows.Next() {
+		var pid string
+		var cnt int
+		if err := fileRows.Scan(&pid, &cnt); err != nil {
+			return nil, fmt.Errorf("graph: scan file count: %w", err)
+		}
+		fileCounts[pid] = cnt
+	}
+	fileRows.Close()
+
+	// 4. Edge counts per project: join edges → symbols on from_id to get project_id.
+	//    Uses the idx_edges_from and idx_symbols_project indexes.
+	edgeCounts := make(map[string]int, len(projectIDs))
+	edgeRows, err := s.db.Query(`
+		SELECT s.project_id, COUNT(DISTINCT e.id)
+		FROM edges e
+		JOIN symbols s ON s.id = e.from_id
+		GROUP BY s.project_id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("graph: edge counts: %w", err)
+	}
+	defer edgeRows.Close()
+	for edgeRows.Next() {
+		var pid string
+		var cnt int
+		if err := edgeRows.Scan(&pid, &cnt); err != nil {
+			return nil, fmt.Errorf("graph: scan edge count: %w", err)
+		}
+		edgeCounts[pid] = cnt
+	}
+	edgeRows.Close()
+
+	// 5. Assemble results in project order.
+	stats := make([]ProjectStats, 0, len(projectIDs))
+	for _, pid := range projectIDs {
+		stats = append(stats, ProjectStats{
+			ProjectID:   pid,
+			SymbolCount: symCounts[pid],
+			EdgeCount:   edgeCounts[pid],
+			FileCount:   fileCounts[pid],
+		})
+	}
+	return stats, nil
 }
 
 // scanSymbols reads all rows from a *sql.Rows into a []parse.Symbol slice.

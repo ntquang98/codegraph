@@ -55,8 +55,19 @@ func (e *ZigExtractor) Extract(path string, src []byte) ([]Symbol, []Edge, error
 	// Track symbol names → IDs for call resolution
 	symbolsByName := make(map[string]string)
 
-	// File module symbol — used as fallback FromID for imports and calls
+	// File module symbol — used as fallback FromID for imports and calls.
+	// Emitted into symbols so edges using it as from_id have a valid source.
 	fileModuleID := GenerateSymbolID("", path, path, KindModule, "")
+	symbols = append(symbols, Symbol{
+		ID:        fileModuleID,
+		Name:      path,
+		Kind:      KindModule,
+		File:      path,
+		StartLine: 1,
+		EndLine:   1,
+		Signature: path,
+		ProjectID: "",
+	})
 
 	// Walk top-level declarations in source_file
 	// The grammar: source_file → _ContainerMembers → _ContainerDeclarations → Decl | TestDecl | ComptimeDecl

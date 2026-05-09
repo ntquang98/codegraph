@@ -337,6 +337,14 @@ body {
   stroke-width: 3;
   filter: brightness(1.4);
 }
+/* Ghost nodes — edge targets not in the current page */
+.graph-node.ghost circle {
+  opacity: 0.35;
+  stroke-dasharray: 3 2;
+}
+.graph-node.ghost text {
+  opacity: 0.35;
+}
 
 .graph-node text {
   font-size: 11px;

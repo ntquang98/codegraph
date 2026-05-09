@@ -29,6 +29,9 @@ type e2eStore struct {
 func (m *e2eStore) SearchSymbols(_ graph.SearchQuery) ([]parse.Symbol, error) {
 	return m.symbols, nil
 }
+func (m *e2eStore) CountSymbols(_ graph.SearchQuery) (int, error) {
+	return len(m.symbols), nil
+}
 func (m *e2eStore) GetSymbol(_ string) (*parse.Symbol, error) {
 	return m.symbol, nil
 }
@@ -46,6 +49,15 @@ func (m *e2eStore) FullTextSearch(_ string, _ int) ([]parse.Symbol, error) {
 }
 func (m *e2eStore) GetAllTrackedFiles() ([]string, error) {
 	return m.files, nil
+}
+func (m *e2eStore) GetAllEdges() ([]parse.Edge, error) {
+	return nil, nil
+}
+func (m *e2eStore) GetEdgesForNodes(_ map[string]struct{}) ([]parse.Edge, error) {
+	return nil, nil
+}
+func (m *e2eStore) GetEdgesFromNodes(_ map[string]struct{}) ([]parse.Edge, error) {
+	return nil, nil
 }
 
 // newE2EStore returns a pre-populated e2eStore.

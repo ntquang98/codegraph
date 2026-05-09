@@ -59,14 +59,34 @@ The default browser is opened automatically unless --no-open is provided.`,
 			}
 
 			dbPath := filepath.Join(loader.RootDir, ".codegraph.db")
-			store, err := graph.Open(dbPath)
+			store, err := graph.OpenReadOnly(dbPath)
 			if err != nil {
 				return fmt.Errorf("open graph store: %w", err)
 			}
 			defer store.Close()
 
-			if err := store.Migrate(); err != nil {
-				return fmt.Errorf("migrate graph store: %w", err)
+			// No Migrate() — the UI is read-only and the schema is managed by
+			// `codegraph build`. Skipping Migrate avoids acquiring a write lock
+			// which would block if another process has the DB open.
+
+			// Print graph size stats so the user knows what they're loading.
+			if symCount, err := store.CountSymbols(graph.SearchQuery{}); err == nil {
+				fmt.Fprintf(cmd.OutOrStdout(), "Graph database: %s\n", dbPath)
+				fmt.Fprintf(cmd.OutOrStdout(), "  Symbols : %d\n", symCount)
+				if edgeCount, err := store.CountEdges(); err == nil {
+					fmt.Fprintf(cmd.OutOrStdout(), "  Edges   : %d\n", edgeCount)
+				}
+				if validEdges, err := store.CountValidEdges(); err == nil {
+					fmt.Fprintf(cmd.OutOrStdout(), "  Valid edges (both endpoints exist): %d\n", validEdges)
+				}
+				if projStats, err := store.GetProjectStats(); err == nil {
+					fmt.Fprintf(cmd.OutOrStdout(), "  Projects: %d\n", len(projStats))
+				}
+				if symCount > 50000 {
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"  ⚠  Large graph (%d symbols) — UI will paginate. Use project filter to focus.\n",
+						symCount)
+				}
 			}
 
 			if frontendFS == nil {

@@ -48,15 +48,24 @@ func (e *TypeScriptExtractor) Extract(path string, src []byte) ([]Symbol, []Edge
 	var edges []Edge
 	symbolsByName := make(map[string]string)
 
-	// Walk the AST to collect declarations
-	var walk func(node *sitter.Node)
-	walk = func(node *sitter.Node) {
+	fileModuleID := GenerateSymbolID("", path, path, KindModule, "")
+
+	// Walk the AST to collect declarations.
+	// enclosingID tracks the symbol ID of the nearest enclosing function/method
+	// so that call_expression edges use the real caller, not the file module.
+	var walk func(node *sitter.Node, enclosingID string)
+	walk = func(node *sitter.Node, enclosingID string) {
 		switch node.Type() {
 		case "function_declaration":
 			sym := extractTSFunction(node, src, path)
 			if sym != nil {
 				symbols = append(symbols, *sym)
 				symbolsByName[sym.Name] = sym.ID
+				// Walk body with this function as the enclosing symbol.
+				for i := 0; i < int(node.ChildCount()); i++ {
+					walk(node.Child(i), sym.ID)
+				}
+				return
 			}
 		case "lexical_declaration", "variable_declaration":
 			// Arrow functions: const foo = () => {}
@@ -66,23 +75,51 @@ func (e *TypeScriptExtractor) Extract(path string, src []byte) ([]Symbol, []Edge
 				symbols = append(symbols, sym)
 				symbolsByName[sym.Name] = sym.ID
 			}
+			// Walk children with the first arrow function as enclosing (best effort).
+			newEnclosing := enclosingID
+			if len(syms) > 0 {
+				newEnclosing = syms[0].ID
+			}
+			for i := 0; i < int(node.ChildCount()); i++ {
+				walk(node.Child(i), newEnclosing)
+			}
+			return
 		case "class_declaration":
 			sym := extractTSClass(node, src, path)
 			if sym != nil {
 				symbols = append(symbols, *sym)
 				symbolsByName[sym.Name] = sym.ID
-				// Extract methods inside the class
 				methodSyms, methodEdges := extractTSClassMembers(node, src, path, sym.ID)
 				symbols = append(symbols, methodSyms...)
 				edges = append(edges, methodEdges...)
 				for _, ms := range methodSyms {
 					symbolsByName[ms.Name] = ms.ID
 				}
-				// Extract extends/implements edges
 				classEdges := extractTSClassEdges(node, src, path, sym.ID, symbolsByName)
 				edges = append(edges, classEdges...)
+				// Walk class body with each method as enclosing.
+				bodyNode := node.ChildByFieldName("body")
+				if bodyNode != nil {
+					for i := 0; i < int(bodyNode.ChildCount()); i++ {
+						member := bodyNode.Child(i)
+						if member.Type() == "method_definition" {
+							methodNameNode := member.ChildByFieldName("name")
+							if methodNameNode != nil {
+								className := ""
+								if nn := node.ChildByFieldName("name"); nn != nil {
+									className = nn.Content(src)
+								}
+								qn := className + "." + methodNameNode.Content(src)
+								mid := GenerateSymbolID("", path, qn, KindMethod, "")
+								walk(member, mid)
+								continue
+							}
+						}
+						walk(member, sym.ID)
+					}
+				}
 			}
-			return // children already processed
+			return
 		case "interface_declaration":
 			sym := extractTSInterface(node, src, path)
 			if sym != nil {
@@ -93,17 +130,18 @@ func (e *TypeScriptExtractor) Extract(path string, src []byte) ([]Symbol, []Edge
 			importSyms, importEdges := extractTSImports(node, src, path)
 			symbols = append(symbols, importSyms...)
 			edges = append(edges, importEdges...)
+			return
 		case "call_expression":
-			callEdge := extractTSCallEdge(node, src, path, symbolsByName)
+			callEdge := extractTSCallEdgeWithCaller(node, src, path, symbolsByName, enclosingID, fileModuleID)
 			if callEdge != nil {
 				edges = append(edges, *callEdge)
 			}
 		}
 		for i := 0; i < int(node.ChildCount()); i++ {
-			walk(node.Child(i))
+			walk(node.Child(i), enclosingID)
 		}
 	}
-	walk(root)
+	walk(root, fileModuleID)
 
 	return symbols, edges, nil
 }
@@ -306,6 +344,16 @@ func extractTSImports(node *sitter.Node, src []byte, path string) ([]Symbol, []E
 	var edges []Edge
 
 	fileModuleID := GenerateSymbolID("", path, path, KindModule, "")
+	syms = append(syms, Symbol{
+		ID:        fileModuleID,
+		Name:      path,
+		Kind:      KindModule,
+		File:      path,
+		StartLine: 1,
+		EndLine:   1,
+		Signature: path,
+		ProjectID: "",
+	})
 
 	// Find the source string (the module path)
 	var importPath string
@@ -341,7 +389,7 @@ func extractTSImports(node *sitter.Node, src []byte, path string) ([]Symbol, []E
 	return syms, edges
 }
 
-func extractTSCallEdge(node *sitter.Node, src []byte, path string, symbolsByName map[string]string) *Edge {
+func extractTSCallEdgeWithCaller(node *sitter.Node, src []byte, path string, symbolsByName map[string]string, callerID, fileModuleID string) *Edge {
 	funcNode := node.ChildByFieldName("function")
 	if funcNode == nil {
 		return nil
@@ -351,8 +399,10 @@ func extractTSCallEdge(node *sitter.Node, src []byte, path string, symbolsByName
 		return nil
 	}
 
-	// Use file module as the "from" (simplified — no enclosing function tracking here)
-	fromID := GenerateSymbolID("", path, path, KindModule, "")
+	fromID := callerID
+	if fromID == "" {
+		fromID = fileModuleID
+	}
 	toID, ok := symbolsByName[calleeName]
 	if !ok {
 		toID = GenerateSymbolID("", path, calleeName, KindFunction, "")

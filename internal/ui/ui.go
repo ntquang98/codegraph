@@ -39,12 +39,16 @@ import (
 // Defining it as an interface makes the server easy to test with a mock.
 type Store interface {
 	SearchSymbols(query graph.SearchQuery) ([]parse.Symbol, error)
+	CountSymbols(query graph.SearchQuery) (int, error)
 	GetSymbol(id string) (*parse.Symbol, error)
 	GetCallers(symbolID string, depth int) ([]parse.Symbol, error)
 	GetCallees(symbolID string, depth int) ([]parse.Symbol, error)
 	GetProjectStats() ([]graph.ProjectStats, error)
 	FullTextSearch(query string, limit int) ([]parse.Symbol, error)
 	GetAllTrackedFiles() ([]string, error)
+	GetAllEdges() ([]parse.Edge, error)
+	GetEdgesForNodes(nodeIDs map[string]struct{}) ([]parse.Edge, error)
+	GetEdgesFromNodes(nodeIDs map[string]struct{}) ([]parse.Edge, error)
 }
 
 // ─── Server ───────────────────────────────────────────────────────────────────
@@ -164,8 +168,16 @@ type edgeDTO struct {
 	Kind   string `json:"Kind"`
 }
 
-// handleGraph returns a paginated list of all symbols (nodes) and edges.
-// Query params: page (default 1), page_size (default 500, max 2000).
+// handleGraph returns a paginated list of symbols (nodes) and their outgoing
+// edges. Module-kind symbols are excluded by default since they represent
+// files rather than code entities and flood the graph.
+//
+// Query params:
+//
+//	page        (default 1)
+//	page_size   (default 100, max 500)
+//	project_id  (optional, filter by project)
+//	kind        (optional, filter by symbol kind; use "module" to include modules)
 func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		corsHeaders(w)
@@ -178,55 +190,79 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	}
 
 	page     := queryInt(r, "page",      1)
-	pageSize := queryInt(r, "page_size", 500)
-	if page < 1     { page = 1 }
-	if pageSize < 1 { pageSize = 1 }
-	if pageSize > 2000 { pageSize = 2000 }
+	pageSize := queryInt(r, "page_size", 100)
+	if page < 1       { page = 1 }
+	if pageSize < 1   { pageSize = 1 }
+	if pageSize > 500 { pageSize = 500 }
 
-	offset := (page - 1) * pageSize
+	offset    := (page - 1) * pageSize
+	kindParam := parse.SymbolKind(r.URL.Query().Get("kind"))
+	projectID := r.URL.Query().Get("project_id")
 
-	symbols, err := s.store.SearchSymbols(graph.SearchQuery{
-		Limit:  pageSize,
-		Offset: offset,
-	})
+	// Exclude module symbols by default — they represent files, not code
+	// entities, and dominate the graph when included.
+	excludeModules := kindParam == "" || kindParam == "module"
+	if kindParam == "module" {
+		// Explicit request for modules — show them.
+		excludeModules = false
+	}
+
+	q := graph.SearchQuery{
+		Kind:      kindParam,
+		ProjectID: projectID,
+		Limit:     pageSize,
+		Offset:    offset,
+	}
+	// When no kind filter is set, exclude modules server-side.
+	if excludeModules && kindParam == "" {
+		q.ExcludeKind = parse.KindModule
+	}
+
+	symbols, err := s.store.SearchSymbols(q)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "query failed: "+err.Error())
 		return
 	}
 
-	// Build a lightweight edge list from the symbols we have.
-	// We use a second search with a large limit to get all symbols for edge
-	// resolution; for large graphs the frontend paginates anyway.
-	allSymbols, err := s.store.SearchSymbols(graph.SearchQuery{Limit: 10000})
+	// Build a set of node IDs on this page.
+	nodeIDs := make(map[string]struct{}, len(symbols))
+	for _, sym := range symbols {
+		nodeIDs[sym.ID] = struct{}{}
+	}
+
+	// Fetch edges where the from_id is in the current page.
+	// This shows outgoing connections even when the target isn't on this page.
+	edges, err := s.store.GetEdgesFromNodes(nodeIDs)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "edge query failed: "+err.Error())
 		return
 	}
 
-	// Collect edges by looking at callers/callees for each symbol.
-	// To keep this efficient we only collect direct (depth=1) edges.
-	edgeSet := map[string]edgeDTO{}
-	for _, sym := range allSymbols {
-		callees, err := s.store.GetCallees(sym.ID, 1)
-		if err != nil {
-			continue
-		}
-		for _, callee := range callees {
-			key := sym.ID + "→" + callee.ID
-			edgeSet[key] = edgeDTO{FromID: sym.ID, ToID: callee.ID, Kind: "calls"}
-		}
+	// Convert to DTO, deduplicating by (from, to, kind).
+	edgeSet := make(map[string]edgeDTO, len(edges))
+	for _, e := range edges {
+		key := e.FromID + "→" + e.ToID + ":" + string(e.Kind)
+		edgeSet[key] = edgeDTO{FromID: e.FromID, ToID: e.ToID, Kind: string(e.Kind)}
+	}
+	edgeDTOs := make([]edgeDTO, 0, len(edgeSet))
+	for _, e := range edgeSet {
+		edgeDTOs = append(edgeDTOs, e)
 	}
 
-	edges := make([]edgeDTO, 0, len(edgeSet))
-	for _, e := range edgeSet {
-		edges = append(edges, e)
+	// Total symbol count (excluding modules for consistency with the page).
+	totalNodes, err := s.store.CountSymbols(graph.SearchQuery{
+		ExcludeKind: parse.KindModule,
+		ProjectID:   projectID,
+	})
+	if err != nil {
+		totalNodes = len(symbols) // fallback
 	}
 
 	writeJSON(w, http.StatusOK, graphResponse{
 		Nodes:      symbols,
-		Edges:      edges,
-		TotalNodes: len(allSymbols),
-		TotalEdges: len(edges),
+		Edges:      edgeDTOs,
+		TotalNodes: totalNodes,
+		TotalEdges: len(edgeDTOs),
 		Page:       page,
 		PageSize:   pageSize,
 	})

@@ -66,20 +66,33 @@ zoomBehaviour = d3
 svg.call(zoomBehaviour);
 
 /* ── API helpers ───────────────────────────────────────────────────────────── */
-async function apiFetch(path) {
-  const res = await fetch(path);
-  if (!res.ok) throw new Error(`API ${path} → ${res.status}`);
-  return res.json();
+async function apiFetch(path, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(path, { signal: controller.signal });
+    if (!res.ok)
+      throw new Error(`API ${path} → ${res.status} ${res.statusText}`);
+    return res.json();
+  } catch (err) {
+    if (err.name === "AbortError")
+      throw new Error(`API ${path} timed out after ${timeoutMs}ms`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /* ── Bootstrap ─────────────────────────────────────────────────────────────── */
 async function init() {
   showLoading(true);
+  showError(null);
   try {
     await Promise.all([loadProjects(), loadGraph()]);
   } catch (err) {
     console.error("init error:", err);
-    showEmpty(true);
+    showError(err.message || String(err));
+    showEmpty(false);
   } finally {
     showLoading(false);
   }
@@ -127,14 +140,39 @@ function populateProjectFilter(projects) {
 }
 
 /* ── Graph data ────────────────────────────────────────────────────────────── */
-async function loadGraph(page = 1, pageSize = 500) {
-  const data = await apiFetch(`/api/graph?page=${page}&page_size=${pageSize}`);
+async function loadGraph(page = 1, pageSize = 100, projectID = "", kind = "") {
+  let url = `/api/graph?page=${page}&page_size=${pageSize}`;
+  if (projectID) url += `&project_id=${encodeURIComponent(projectID)}`;
+  if (kind) url += `&kind=${encodeURIComponent(kind)}`;
+
+  const data = await apiFetch(url);
   allNodes = (data.nodes || []).map((n) => ({ ...n, id: n.ID || n.id }));
+
+  // Build a node ID set for fast lookup — edges may reference nodes not on
+  // this page (outgoing edges to other pages), so we add ghost nodes for them.
+  const nodeMap = new Map(allNodes.map((n) => [n.id, n]));
+
   allLinks = (data.edges || []).map((e) => ({
     source: e.FromID || e.from_id,
     target: e.ToID || e.to_id,
     kind: e.Kind || e.kind,
   }));
+
+  // Add ghost nodes for edge targets not in the current page so D3 can render
+  // the links without crashing.
+  for (const link of allLinks) {
+    if (!nodeMap.has(link.target)) {
+      const ghost = {
+        id: link.target,
+        ID: link.target,
+        Name: link.target.slice(0, 8),
+        Kind: "unknown",
+        ghost: true,
+      };
+      allNodes.push(ghost);
+      nodeMap.set(link.target, ghost);
+    }
+  }
 
   const totalSymbols = data.total_nodes ?? allNodes.length;
   const totalEdges = data.total_edges ?? allLinks.length;
@@ -174,7 +212,7 @@ function renderGraph(nodes, links) {
     .selectAll("g")
     .data(nodes)
     .join("g")
-    .attr("class", "graph-node")
+    .attr("class", (d) => (d.ghost ? "graph-node ghost" : "graph-node"))
     .attr("role", "button")
     .attr("tabindex", "0")
     .attr("aria-label", (d) => `${d.Name || d.name} (${d.Kind || d.kind})`)
@@ -444,28 +482,20 @@ function focusSymbol(s) {
 kindFilter.addEventListener("change", applyFilters);
 projectFilter.addEventListener("change", applyFilters);
 
-function applyFilters() {
+async function applyFilters() {
   const kind = kindFilter.value;
   const project = projectFilter.value;
 
-  const filtered = allNodes.filter(
-    (n) =>
-      (!kind || (n.Kind || n.kind) === kind) &&
-      (!project || (n.ProjectID || n.project_id) === project),
-  );
-  const filteredIds = new Set(filtered.map((n) => n.id || n.ID));
-  const filteredLinks = allLinks.filter(
-    (l) =>
-      filteredIds.has(l.source.id || l.source) &&
-      filteredIds.has(l.target.id || l.target),
-  );
-
-  if (filtered.length === 0) {
-    showEmpty(true);
-    return;
+  showLoading(true);
+  showError(null);
+  try {
+    await loadGraph(1, 100, project, kind);
+  } catch (err) {
+    console.error("filter error:", err);
+    showError(err.message || String(err));
+  } finally {
+    showLoading(false);
   }
-  showEmpty(false);
-  renderGraph(filtered, filteredLinks);
 }
 
 /* ── Zoom controls ─────────────────────────────────────────────────────────── */
@@ -490,6 +520,16 @@ function showLoading(on) {
 }
 function showEmpty(on) {
   graphEmpty.hidden = !on;
+}
+function showError(msg) {
+  const el = $("#graph-error");
+  if (!el) return;
+  if (!msg) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  el.textContent = "Error: " + msg;
 }
 
 function escHtml(str) {
